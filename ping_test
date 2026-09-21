@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+tmux kill-session -t pt 2>/dev/null || true
+
+tmux new-session -d -s pt "ping -c5 1.1.1.1; exec bash" \; \
+split-window -h "ping -c5 8.8.8.8; exec bash" \; \
+select-pane -t 0 \; \
+split-window -v "ping -c5 google.com; exec bash" \; \
+select-pane -t 1 \; \
+split-window -v "traceroute 8.8.8.8; exec bash" \; \
+select-layout tiled \; \
+set-option -t pt status off \; \
+set-option -t pt window-size latest \; \
+attach-session -t pt
