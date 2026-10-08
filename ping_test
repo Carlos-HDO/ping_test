@@ -1,26 +1,82 @@
 #!/usr/bin/env bash
+# Painel tmux de diagnóstico de rede: ping e traceroute simultâneos em grid 2x2.
+
+set -euo pipefail
 
 SESSION="pt"
 
-# Encerra a sessão antiga, caso exista
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+# Destinos (podem ser sobrescritos por variáveis de ambiente)
+PING_1="${PT_PING_1:-1.1.1.1}"
+PING_2="${PT_PING_2:-8.8.8.8}"
+PING_DNS="${PT_PING_DNS:-google.com}"
+TRACE="${PT_TRACE:-8.8.8.8}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<EOF
+Uso: $(basename "$0")
+
+Abre a sessão tmux '$SESSION' com quatro painéis de diagnóstico:
+  ping -c5 $PING_1 | ping -c5 $PING_2 | ping -c5 $PING_DNS | traceroute -n $TRACE
+
+Variáveis de ambiente: PT_PING_1, PT_PING_2, PT_PING_DNS, PT_TRACE
+EOF
+    exit 0
+fi
+
+# Verifica dependências
+missing=()
+for cmd in tmux ping traceroute; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+done
+if (( ${#missing[@]} )); then
+    echo "Erro: dependências ausentes: ${missing[*]}" >&2
+    echo "Consulte o README para instruções de instalação." >&2
+    exit 1
+fi
+
+# Monta o comando de um painel; ao terminar, o painel cai na shell do usuário
+pane_cmd() {
+    local cmd
+    printf -v cmd '%q ' "$@"
+    printf '%s; exec %q' "$cmd" "${SHELL:-bash}"
+}
+
+# O prefixo '=' força correspondência exata do nome da sessão
+# (sem ele, '-t pt' casaria com qualquer sessão iniciada por "pt", ex.: "ptolemy")
+TARGET="=$SESSION"
+
+# Renomeia a sessão anterior em vez de encerrá-la já: se o script estiver rodando
+# dentro dela, encerrá-la agora mataria o próprio script antes de criar a nova
+OLD=""
+if tmux has-session -t "$TARGET" 2>/dev/null; then
+    OLD="${SESSION}-old-$$"
+    tmux rename-session -t "$TARGET" "$OLD"
+fi
 
 # Cria a nova sessão e armazena os IDs únicos dos painéis (compatível com base-index 0 e 1)
-P1=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' 'ping -c5 1.1.1.1; exec bash')
-P2=$(tmux split-window -h -t "$P1" -P -F '#{pane_id}' 'ping -c5 8.8.8.8; exec bash')
-P3=$(tmux split-window -v -t "$P1" -P -F '#{pane_id}' 'ping -c5 google.com; exec bash')
-P4=$(tmux split-window -v -t "$P2" -P -F '#{pane_id}' 'traceroute 8.8.8.8; exec bash')
+if ! P1=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' "$(pane_cmd ping -c5 "$PING_1")"); then
+    echo "Erro: não foi possível criar a sessão tmux '$SESSION'." >&2
+    [[ -n "$OLD" ]] && tmux rename-session -t "=$OLD" "$SESSION"
+    exit 1
+fi
+P2=$(tmux split-window -h -t "$P1" -P -F '#{pane_id}' "$(pane_cmd ping -c5 "$PING_2")")
+tmux split-window -v -t "$P1" "$(pane_cmd ping -c5 "$PING_DNS")"
+tmux split-window -v -t "$P2" "$(pane_cmd traceroute -n "$TRACE")"
 
 # Organiza o layout em grid 2x2
-tmux select-layout -t "$SESSION" tiled 2>/dev/null || true
+tmux select-layout -t "$TARGET" tiled 2>/dev/null || true
 tmux select-pane -t "$P1"
 
 # Desativa a barra de status para exibição limpa
-tmux set-option -t "$SESSION" status off 2>/dev/null || true
+tmux set-option -t "$TARGET" status off >/dev/null 2>&1 || true
 
-# Conecta à sessão
+# Conecta à sessão e só então descarta a anterior
 if [[ -n "${TMUX:-}" ]]; then
-    tmux switch-client -t "$SESSION"
+    tmux switch-client -t "$TARGET" 2>/dev/null || true
+    # Último passo: se o script roda dentro da sessão antiga, ele termina aqui
+    [[ -n "$OLD" ]] && tmux kill-session -t "=$OLD" 2>/dev/null
+    exit 0
 else
-    tmux attach-session -t "$SESSION"
+    [[ -n "$OLD" ]] && tmux kill-session -t "=$OLD" 2>/dev/null
+    exec tmux attach-session -t "$TARGET"
 fi
