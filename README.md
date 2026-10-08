@@ -1,41 +1,44 @@
 # Ping Test (`pt`)
 
-Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` com testes simultâneos de conectividade e rota para destinos públicos.
+Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` com testes simultâneos e aponta **onde** está o problema: rede local, provedor, DNS ou acesso web.
 
 ---
 
 ## ⚡ Funcionalidades
 
-- **Painel em `tmux`**: abre quatro painéis de diagnóstico no terminal atual.
-- **Testes de conectividade**: executa `ping` para `1.1.1.1`, `8.8.8.8` e `google.com`.
-- **Rastreamento de rota**: executa `traceroute -n` para `8.8.8.8` (sem resolução reversa, mais rápido).
-- **Layout otimizado**: usa todo o espaço disponível no terminal e remove a barra de status do `tmux`.
+- **Painel em `tmux`**: seis painéis em grade, cada um identificado por título na borda.
+- **Gateway local**: detectado automaticamente; separa falha no Wi-Fi/cabo de falha no provedor.
+- **Conectividade**: `ping` para `1.1.1.1` e `8.8.8.8`.
+- **DNS**: compara o resolvedor do sistema com um DNS externo (`@1.1.1.1`) e distingue resolvedor quebrado, DNS bloqueado e nome inexistente.
+- **HTTP/HTTPS**: funciona mesmo onde ICMP é bloqueado e detecta portal cativo ou proxy interceptando.
+- **Rota**: `traceroute -n` ou, na falta dele, `tracepath -n` (não exige root).
+- **Vereditos**: os painéis de gateway, DNS e HTTP terminam com uma conclusão (✅/❌).
 - **Reexecução segura**: substitui apenas a sessão chamada exatamente `pt`, inclusive quando executada de dentro dela.
-- **Destinos configuráveis**: por variáveis de ambiente.
-- **Verificação de dependências**: avisa claramente se `tmux`, `ping` ou `traceroute` estiverem ausentes.
+- **Destinos configuráveis** por variáveis de ambiente.
 
 ---
 
 ## 📦 Dependências
 
-Esta ferramenta requer `tmux`, `ping` e `traceroute`.
+- **Obrigatórias**: `tmux`, `ping` e `traceroute` **ou** `tracepath`.
+- **Opcionais**: `dig` (teste com DNS externo) e `curl` (teste HTTP). Sem elas, o painel correspondente avisa o que instalar.
 
 ### Debian / Ubuntu / Kali / Pop!_OS
 
 ```bash
-sudo apt update && sudo apt install -y tmux iputils-ping traceroute
+sudo apt update && sudo apt install -y tmux iputils-ping traceroute dnsutils curl
 ```
 
 ### Arch Linux / Manjaro
 
 ```bash
-sudo pacman -S tmux iputils traceroute
+sudo pacman -S tmux iputils traceroute bind curl
 ```
 
 ### Fedora
 
 ```bash
-sudo dnf install tmux iputils traceroute
+sudo dnf install tmux iputils traceroute bind-utils curl
 ```
 
 ---
@@ -85,12 +88,16 @@ Ao terminar, cada painel abre a sua shell (`$SHELL`). Executar `pt` novamente, i
 PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 ```
 
-| Variável | Padrão | Painel |
+| Variável | Padrão | Uso |
 | :--- | :--- | :--- |
+| `PT_GATEWAY` | detectado via `ip route` | Gateway local |
 | `PT_PING_1` | `1.1.1.1` | Ping 1 |
 | `PT_PING_2` | `8.8.8.8` | Ping 2 |
-| `PT_PING_DNS` | `google.com` | Ping com resolução DNS |
-| `PT_TRACE` | `8.8.8.8` | Traceroute |
+| `PT_PING_DNS` | `google.com` | Nome consultado no painel DNS |
+| `PT_DNS_SERVER` | `1.1.1.1` | DNS externo de comparação |
+| `PT_HTTP_URL` | `https://www.cloudflare.com` | Teste HTTPS |
+| `PT_PORTAL_URL` | `http://connectivitycheck.gstatic.com/generate_204` | Detecção de portal cativo (espera HTTP 204) |
+| `PT_TRACE` | `8.8.8.8` | Rota |
 
 ### Encerrar ou desconectar da sessão
 
@@ -105,12 +112,24 @@ tmux kill-session -t =pt
 
 ## 🛠️ Painéis executados
 
-| Painel | Comando |
+| Painel | O que faz |
 | :--- | :--- |
-| Cloudflare DNS | `ping -c5 1.1.1.1` |
-| Google DNS | `ping -c5 8.8.8.8` |
-| Resolução DNS | `ping -c5 google.com` |
-| Rota de rede | `traceroute -n 8.8.8.8` |
+| Gateway | `ping -c5` no gateway padrão |
+| Ping 1.1.1.1 | `ping -c5 1.1.1.1` |
+| Ping 8.8.8.8 | `ping -c5 8.8.8.8` |
+| DNS | `getent hosts` (sistema) × `dig @1.1.1.1` (externo) + `ping -c3` por nome |
+| HTTP | `curl` em HTTPS + verificação de portal cativo |
+| Rota | `traceroute -n 8.8.8.8` (ou `tracepath -n`) |
+
+### Como ler o resultado
+
+| Sintoma | Provável causa |
+| :--- | :--- |
+| Gateway ❌ | Rede local: Wi-Fi, cabo, roteador ou DHCP |
+| Gateway ✅, pings ❌ | Provedor de internet |
+| Pings ✅, DNS ❌ (externo responde) | Resolvedor configurado (roteador ou `/etc/resolv.conf`) |
+| Pings ❌, HTTP ✅ | ICMP bloqueado na rede; a internet funciona |
+| HTTP ❌ com resposta inesperada | Portal cativo (Wi-Fi público/hotel) ou proxy |
 
 ---
 
