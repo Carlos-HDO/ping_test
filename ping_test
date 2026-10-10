@@ -18,27 +18,27 @@ warn()   { printf '\n⚠️  %s\n' "$*"; }
 
 # Comparação e formatação de decimais (o bash só lida com inteiros)
 gt()  { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
-num() { local v; v=$(awk -v x="$1" 'BEGIN { printf "%.1f", x }'); echo "${v/./,}"; }
+num() { awk -v x="$1" 'BEGIN { printf "%.1f", x }'; }
 
 # Gateway local: separa problema na rede local (Wi-Fi/cabo) de problema no provedor
 pane_gateway() {
     local gw="${1:-}"
     case "$gw" in
         "")
-            info "Não foi possível detectar o gateway. Defina PT_GATEWAY=<ip> para testá-lo."
+            info "Could not detect the gateway. Set PT_GATEWAY=<ip> to test it."
             return ;;
-        sem-rota)
-            fail "Nenhuma rota padrão: sem conexão com a rede local (Wi-Fi, cabo ou DHCP)."
+        no-route)
+            fail "No default route: no connection to the local network (Wi-Fi, cable or DHCP)."
             return ;;
-        sem-via)
-            info "Rota padrão sem gateway (VPN ou link ponto a ponto); teste não se aplica."
+        no-via)
+            info "Default route has no gateway (VPN or point-to-point link); test does not apply."
             return ;;
     esac
-    header "Gateway local: $gw"
+    header "Local gateway: $gw"
     if ping -c5 "$gw"; then
-        ok "Rede local OK."
+        ok "Local network OK."
     else
-        fail "Gateway sem resposta: problema na rede local (alguns roteadores bloqueiam ICMP; compare com os outros painéis)."
+        fail "Gateway not responding: local network problem (some routers block ICMP; compare with the other panes)."
     fi
 }
 
@@ -48,19 +48,19 @@ pane_dns() {
     local -a limit=()
     command -v timeout >/dev/null 2>&1 && limit=(timeout 6)
 
-    header "DNS do sistema: $host"
+    header "System DNS: $host"
     if ! command -v getent >/dev/null 2>&1; then
-        echo "(getent não encontrado: teste do DNS do sistema ignorado)"
+        echo "(getent not found: system DNS test skipped)"
     elif out=$("${limit[@]}" getent hosts "$host") && [[ -n "$out" ]]; then
         echo "$out"
         sys="ok"
     else
-        echo "(sem resposta)"
-        sys="erro"
+        echo "(no response)"
+        sys="error"
     fi
 
     echo
-    header "DNS externo: @$server"
+    header "External DNS: @$server"
     if command -v dig >/dev/null 2>&1; then
         out=$(dig +time=3 +tries=1 +noall +comments +answer "@$server" "$host" A 2>&1) || true
         status=$(sed -n 's/.*status: \([A-Z]*\).*/\1/p' <<<"$out" | head -n1)
@@ -69,37 +69,37 @@ pane_dns() {
             echo "$answers"
             ext="ok"
         elif [[ "$status" == NXDOMAIN ]]; then
-            echo "NXDOMAIN (o nome não existe)"
+            echo "NXDOMAIN (name does not exist)"
             ext="nx"
         elif [[ -n "$status" ]]; then
-            echo "Resposta: $status"
-            ext="erro"
+            echo "Response: $status"
+            ext="error"
         else
-            echo "(sem resposta)"
-            ext="erro"
+            echo "(no response)"
+            ext="error"
         fi
     else
-        echo "(dig não encontrado: instale dnsutils/bind-utils para este teste)"
+        echo "(dig not found: install dnsutils/bind-utils for this test)"
     fi
 
     echo
-    header "Ping por nome: $host"
+    header "Ping by name: $host"
     ping -c3 "$host" || true
 
     if [[ "$sys" == ok ]]; then
-        ok "DNS do sistema OK."
+        ok "System DNS OK."
     elif [[ "$ext" == nx ]]; then
-        fail "O nome $host não existe (NXDOMAIN): confira o destino em PT_PING_DNS."
-    elif [[ "$ext" == ok && "$sys" == erro ]]; then
-        fail "O DNS do sistema falhou, mas o externo responde: problema no resolvedor configurado (DNS do roteador ou /etc/resolv.conf)."
+        fail "The name $host does not exist (NXDOMAIN): check the target in PT_PING_DNS."
+    elif [[ "$ext" == ok && "$sys" == error ]]; then
+        fail "System DNS failed, but the external one responds: problem with the configured resolver (router DNS or /etc/resolv.conf)."
     elif [[ "$ext" == ok ]]; then
-        ok "DNS externo OK (DNS do sistema não testado)."
-    elif [[ "$ext" == erro ]]; then
-        fail "Nenhum DNS respondeu: sem internet ou porta 53 bloqueada."
-    elif [[ "$sys" == erro ]]; then
-        fail "O DNS do sistema falhou."
+        ok "External DNS OK (system DNS not tested)."
+    elif [[ "$ext" == error ]]; then
+        fail "No DNS server responded: no internet or port 53 blocked."
+    elif [[ "$sys" == error ]]; then
+        fail "System DNS failed."
     else
-        info "Sem getent nem dig: veja o resultado do ping por nome acima."
+        info "Neither getent nor dig available: see the ping by name result above."
     fi
 }
 
@@ -108,7 +108,7 @@ pane_http() {
     local url="$1" portal="$2" out code="" code_https t_conn t_total https_ok=0
 
     if ! command -v curl >/dev/null 2>&1; then
-        fail "curl não encontrado: instale curl para este teste."
+        fail "curl not found: install curl for this test."
         return
     fi
 
@@ -116,23 +116,23 @@ pane_http() {
     if out=$(curl -sS -o /dev/null --max-time 10 \
             -w '%{http_code} %{time_connect} %{time_total}' "$url"); then
         read -r code_https t_conn t_total <<<"$out"
-        echo "HTTP $code_https · conexão ${t_conn}s · total ${t_total}s"
+        echo "HTTP $code_https · connect ${t_conn}s · total ${t_total}s"
         https_ok=1
     fi
 
     echo
-    header "Portal cativo: $portal"
+    header "Captive portal: $portal"
     code=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "$portal") || code=""
-    echo "HTTP ${code:-sem resposta} (esperado: 204)"
+    echo "HTTP ${code:-no response} (expected: 204)"
 
     if [[ "$code" == 204 ]] && (( https_ok )); then
-        ok "Acesso web OK, sem portal cativo."
+        ok "Web access OK, no captive portal."
     elif [[ -n "$code" && "$code" != 204 ]]; then
-        fail "Resposta inesperada ($code): provável portal cativo (Wi-Fi público/hotel) ou proxy interceptando."
+        fail "Unexpected response ($code): likely a captive portal (public/hotel Wi-Fi) or an intercepting proxy."
     elif (( https_ok )); then
-        ok "HTTPS OK (verificação de portal cativo sem resposta)."
+        ok "HTTPS OK (captive portal check got no response)."
     else
-        fail "Sem acesso web: se os pings funcionam, um proxy ou firewall pode estar bloqueando HTTP(S)."
+        fail "No web access: if pings work, a proxy or firewall may be blocking HTTP(S)."
     fi
 }
 
@@ -148,31 +148,31 @@ pane_ping() {
     stats=$(sed -n 's/^rtt [^=]*= \([0-9.\/]*\) ms.*/\1/p' <<<"$out")
 
     if [[ -z "$stats" ]]; then
-        fail "Sem resposta de $host: sem internet ou ICMP bloqueado (compare com o painel HTTP)."
+        fail "No reply from $host: no internet or ICMP blocked (compare with the HTTP pane)."
         return
     fi
     IFS=/ read -r min avg max mdev <<<"$stats"
-    printf '\nPerda %s%% · média %s ms · mín %s · máx %s · variação %s ms\n' \
+    printf '\nLoss %s%% · avg %s ms · min %s · max %s · jitter %s ms\n' \
         "${loss:-?}" "$(num "$avg")" "$(num "$min")" "$(num "$max")" "$(num "$mdev")"
 
     if gt "$avg" "$very_slow"; then
-        issues+=("muito lenta (média $(num "$avg") ms, acima de $very_slow ms)")
+        issues+=("very slow (avg $(num "$avg") ms, above $very_slow ms)")
     elif gt "$avg" "$slow"; then
-        issues+=("um pouco lenta (média $(num "$avg") ms, ideal até $slow ms)")
+        issues+=("a bit slow (avg $(num "$avg") ms, ideally up to $slow ms)")
     fi
     if gt "${loss:-0}" 0; then
-        issues+=("perdendo pacotes (${loss}%)")
+        issues+=("losing packets (${loss}%)")
     fi
     if gt "$mdev" "$jitter_max"; then
-        issues+=("oscilando (variação de $(num "$mdev") ms, pico de $(num "$max") ms)")
+        issues+=("latency is unstable (jitter $(num "$mdev") ms, peak $(num "$max") ms)")
     fi
 
     if (( ${#issues[@]} == 0 )); then
-        ok "Internet OK: média $(num "$avg") ms, sem perda de pacotes."
+        ok "Internet OK: avg $(num "$avg") ms, no packet loss."
     else
         local msg
         msg=$(printf '%s; ' "${issues[@]}")
-        warn "Internet funcionando, mas ${msg%; }."
+        warn "Internet working, but ${msg%; }."
     fi
 }
 
@@ -194,7 +194,7 @@ if [[ "${1:-}" == "--pane" ]]; then
         dns)     pane_dns "$@" ;;
         http)    pane_http "$@" ;;
         route)   pane_route "$@" ;;
-        *)       echo "Painel desconhecido: $kind" >&2; exit 1 ;;
+        *)       echo "Unknown pane: $kind" >&2; exit 1 ;;
     esac
     exit 0
 fi
@@ -203,8 +203,8 @@ fi
 # Configuração e criação da sessão
 # ---------------------------------------------------------------------------
 
-# Gateway da rota padrão (IPv4, senão IPv6). Imprime o IP, "sem-via" se a rota não
-# tiver gateway (VPN), "sem-rota" se não houver rota padrão, ou nada se não der para saber
+# Gateway da rota padrão (IPv4, senão IPv6). Imprime o IP, "no-via" se a rota não
+# tiver gateway (VPN), "no-route" se não houver rota padrão, ou nada se não der para saber
 detect_gateway() {
     local fam routes gw dest hex
     if command -v ip >/dev/null 2>&1; then
@@ -224,10 +224,10 @@ detect_gateway() {
                         exit
                     }
                 }' <<<"$routes")
-            echo "${gw:-sem-via}"
+            echo "${gw:-no-via}"
             return
         done
-        echo "sem-rota"
+        echo "no-route"
         return
     fi
     # Sem iproute2: lê a tabela IPv4 do kernel (gateway em hexadecimal little-endian).
@@ -236,7 +236,7 @@ detect_gateway() {
     while read -r _ dest hex _; do
         [[ "$dest" == 00000000 ]] || continue
         if [[ "$hex" == 00000000 ]]; then
-            echo "sem-via"
+            echo "no-via"
         else
             printf '%d.%d.%d.%d\n' "0x${hex:6:2}" "0x${hex:4:2}" "0x${hex:2:2}" "0x${hex:0:2}"
         fi
@@ -261,9 +261,9 @@ LAT_VERY_SLOW=$(int_or "${PT_LAT_VERY_SLOW:-}" 150)
 JITTER_MAX=$(int_or "${PT_JITTER:-}" 30)
 
 case "$GATEWAY" in
-    "")       GATEWAY_LABEL="(não detectado)" ;;
-    sem-rota) GATEWAY_LABEL="(sem rota padrão)" ;;
-    sem-via)  GATEWAY_LABEL="(rota sem gateway)" ;;
+    "")       GATEWAY_LABEL="(not detected)" ;;
+    no-route) GATEWAY_LABEL="(no default route)" ;;
+    no-via)  GATEWAY_LABEL="(route without gateway)" ;;
     *)        GATEWAY_LABEL="$GATEWAY" ;;
 esac
 
@@ -271,20 +271,20 @@ if command -v traceroute >/dev/null 2>&1; then ROUTE_TOOL="traceroute"; else ROU
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<EOF
-Uso: $(basename "$0")
+Usage: $(basename "$0")
 
-Abre a sessão tmux '$SESSION' com seis painéis de diagnóstico:
+Opens the tmux session '$SESSION' with six diagnostic panes:
   Gateway   ping -c5 $GATEWAY_LABEL
   Ping      ping -c5 $PING_1
   Ping      ping -c5 $PING_2
-  DNS       $PING_DNS pelo DNS do sistema e por @$DNS_SERVER
-  HTTP      $HTTP_URL + verificação de portal cativo
-  Rota      $ROUTE_TOOL -n $TRACE
+  DNS       $PING_DNS via system DNS and @$DNS_SERVER
+  HTTP      $HTTP_URL + captive portal check
+  Route     $ROUTE_TOOL -n $TRACE
 
-Latência nos pings: OK até ${LAT_SLOW} ms, muito lenta acima de ${LAT_VERY_SLOW} ms,
-oscilando com variação acima de ${JITTER_MAX} ms.
+Ping latency: OK up to ${LAT_SLOW} ms, very slow above ${LAT_VERY_SLOW} ms,
+unstable with jitter above ${JITTER_MAX} ms.
 
-Variáveis de ambiente: PT_GATEWAY, PT_PING_1, PT_PING_2, PT_PING_DNS,
+Environment variables: PT_GATEWAY, PT_PING_1, PT_PING_2, PT_PING_DNS,
 PT_DNS_SERVER, PT_HTTP_URL, PT_PORTAL_URL, PT_TRACE,
 PT_LAT_SLOW, PT_LAT_VERY_SLOW, PT_JITTER
 EOF
@@ -297,11 +297,11 @@ for cmd in tmux ping; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if ! command -v traceroute >/dev/null 2>&1 && ! command -v tracepath >/dev/null 2>&1; then
-    missing+=("traceroute ou tracepath")
+    missing+=("traceroute or tracepath")
 fi
 if (( ${#missing[@]} )); then
-    echo "Erro: dependências ausentes: ${missing[*]}" >&2
-    echo "Consulte o README para instruções de instalação." >&2
+    echo "Error: missing dependencies: ${missing[*]}" >&2
+    echo "See the README for installation instructions." >&2
     exit 1
 fi
 
@@ -327,7 +327,7 @@ fi
 # Cria a nova sessão e armazena os IDs únicos dos painéis (compatível com base-index 0 e 1)
 if ! LAST=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' \
         "$(pane_cmd "$SELF" --pane gateway "$GATEWAY")"); then
-    echo "Erro: não foi possível criar a sessão tmux '$SESSION'." >&2
+    echo "Error: could not create the tmux session '$SESSION'." >&2
     [[ -n "$OLD" ]] && tmux rename-session -t "=$OLD" "$SESSION"
     exit 1
 fi
@@ -348,7 +348,7 @@ add_pane "Ping $PING_1"     "$SELF" --pane ping "$PING_1" "$LAT_SLOW" "$LAT_VERY
 add_pane "Ping $PING_2"     "$SELF" --pane ping "$PING_2" "$LAT_SLOW" "$LAT_VERY_SLOW" "$JITTER_MAX"
 add_pane "DNS $PING_DNS"    "$SELF" --pane dns "$PING_DNS" "$DNS_SERVER"
 add_pane "HTTP"             "$SELF" --pane http "$HTTP_URL" "$PORTAL_URL"
-add_pane "Rota $TRACE ($ROUTE_TOOL)" "$SELF" --pane route "$TRACE"
+add_pane "Route $TRACE ($ROUTE_TOOL)" "$SELF" --pane route "$TRACE"
 
 tmux select-pane -t "$FIRST"
 

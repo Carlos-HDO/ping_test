@@ -15,6 +15,7 @@ Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` co
 - **Vereditos**: todos os painéis, exceto o de rota, terminam com uma conclusão (✅ OK, ⚠️ funcionando com problemas, ❌ falha).
 - **Reexecução segura**: substitui apenas a sessão chamada exatamente `pt`, inclusive quando executada de dentro dela.
 - **Destinos configuráveis** por variáveis de ambiente.
+- **Mensagens em inglês**: a saída da ferramenta (painéis, vereditos, `--help` e instalador) é exibida em inglês.
 
 ---
 
@@ -98,9 +99,9 @@ PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 | `PT_DNS_SERVER` | `1.1.1.1` | DNS externo de comparação |
 | `PT_HTTP_URL` | `https://www.cloudflare.com` | Teste HTTPS |
 | `PT_PORTAL_URL` | `http://connectivitycheck.gstatic.com/generate_204` | Detecção de portal cativo (espera HTTP 204) |
-| `PT_TRACE` | `8.8.8.8` | Rota |
-| `PT_LAT_SLOW` | `60` | Latência média (ms) acima da qual o ping é "um pouco lento" |
-| `PT_LAT_VERY_SLOW` | `150` | Latência média (ms) acima da qual o ping é "muito lento" |
+| `PT_TRACE` | `8.8.8.8` | Route |
+| `PT_LAT_SLOW` | `60` | Latência média (ms) acima da qual o ping é "a bit slow" |
+| `PT_LAT_VERY_SLOW` | `150` | Latência média (ms) acima da qual o ping é "very slow" |
 | `PT_JITTER` | `30` | Variação (ms) acima da qual a latência é considerada oscilante |
 
 ### Encerrar ou desconectar da sessão
@@ -123,7 +124,7 @@ tmux kill-session -t =pt
 | Ping 8.8.8.8 | `ping -c5 8.8.8.8` + resumo de perda, latência e oscilação |
 | DNS | `getent hosts` (sistema) × `dig @1.1.1.1` (externo) + `ping -c3` por nome |
 | HTTP | `curl` em HTTPS + verificação de portal cativo |
-| Rota | `traceroute -n 8.8.8.8` (ou `tracepath -n`) |
+| Route | `traceroute -n 8.8.8.8` (ou `tracepath -n`) |
 
 ### Como ler o resultado
 
