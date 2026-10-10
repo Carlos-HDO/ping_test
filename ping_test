@@ -1,26 +1,313 @@
 #!/usr/bin/env bash
+# Painel tmux de diagnóstico de rede: gateway, internet, DNS, HTTP e rota lado a lado.
+
+set -euo pipefail
 
 SESSION="pt"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
-# Encerra a sessão antiga, caso exista
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Painéis (executados pelo próprio script dentro do tmux via --pane <tipo>)
+# ---------------------------------------------------------------------------
+
+header() { printf '== %s ==\n' "$*"; }
+ok()     { printf '\n✅ %s\n' "$*"; }
+fail()   { printf '\n❌ %s\n' "$*"; }
+info()   { printf '\nℹ️  %s\n' "$*"; }
+
+# Gateway local: separa problema na rede local (Wi-Fi/cabo) de problema no provedor
+pane_gateway() {
+    local gw="${1:-}"
+    case "$gw" in
+        "")
+            info "Não foi possível detectar o gateway. Defina PT_GATEWAY=<ip> para testá-lo."
+            return ;;
+        sem-rota)
+            fail "Nenhuma rota padrão: sem conexão com a rede local (Wi-Fi, cabo ou DHCP)."
+            return ;;
+        sem-via)
+            info "Rota padrão sem gateway (VPN ou link ponto a ponto); teste não se aplica."
+            return ;;
+    esac
+    header "Gateway local: $gw"
+    if ping -c5 "$gw"; then
+        ok "Rede local OK."
+    else
+        fail "Gateway sem resposta: problema na rede local (alguns roteadores bloqueiam ICMP; compare com os outros painéis)."
+    fi
+}
+
+# DNS: compara o resolvedor do sistema com um servidor externo
+pane_dns() {
+    local host="$1" server="$2" out status answers sys="" ext=""
+    local -a limit=()
+    command -v timeout >/dev/null 2>&1 && limit=(timeout 6)
+
+    header "DNS do sistema: $host"
+    if ! command -v getent >/dev/null 2>&1; then
+        echo "(getent não encontrado: teste do DNS do sistema ignorado)"
+    elif out=$("${limit[@]}" getent hosts "$host") && [[ -n "$out" ]]; then
+        echo "$out"
+        sys="ok"
+    else
+        echo "(sem resposta)"
+        sys="erro"
+    fi
+
+    echo
+    header "DNS externo: @$server"
+    if command -v dig >/dev/null 2>&1; then
+        out=$(dig +time=3 +tries=1 +noall +comments +answer "@$server" "$host" A 2>&1) || true
+        status=$(sed -n 's/.*status: \([A-Z]*\).*/\1/p' <<<"$out" | head -n1)
+        answers=$(awk '!/^;/ && NF { print $NF }' <<<"$out")
+        if [[ "$status" == NOERROR && -n "$answers" ]]; then
+            echo "$answers"
+            ext="ok"
+        elif [[ "$status" == NXDOMAIN ]]; then
+            echo "NXDOMAIN (o nome não existe)"
+            ext="nx"
+        elif [[ -n "$status" ]]; then
+            echo "Resposta: $status"
+            ext="erro"
+        else
+            echo "(sem resposta)"
+            ext="erro"
+        fi
+    else
+        echo "(dig não encontrado: instale dnsutils/bind-utils para este teste)"
+    fi
+
+    echo
+    header "Ping por nome: $host"
+    ping -c3 "$host" || true
+
+    if [[ "$sys" == ok ]]; then
+        ok "DNS do sistema OK."
+    elif [[ "$ext" == nx ]]; then
+        fail "O nome $host não existe (NXDOMAIN): confira o destino em PT_PING_DNS."
+    elif [[ "$ext" == ok && "$sys" == erro ]]; then
+        fail "O DNS do sistema falhou, mas o externo responde: problema no resolvedor configurado (DNS do roteador ou /etc/resolv.conf)."
+    elif [[ "$ext" == ok ]]; then
+        ok "DNS externo OK (DNS do sistema não testado)."
+    elif [[ "$ext" == erro ]]; then
+        fail "Nenhum DNS respondeu: sem internet ou porta 53 bloqueada."
+    elif [[ "$sys" == erro ]]; then
+        fail "O DNS do sistema falhou."
+    else
+        info "Sem getent nem dig: veja o resultado do ping por nome acima."
+    fi
+}
+
+# HTTP(S): funciona mesmo onde ICMP é bloqueado e detecta portal cativo/proxy
+pane_http() {
+    local url="$1" portal="$2" out code="" code_https t_conn t_total https_ok=0
+
+    if ! command -v curl >/dev/null 2>&1; then
+        fail "curl não encontrado: instale curl para este teste."
+        return
+    fi
+
+    header "HTTPS: $url"
+    if out=$(curl -sS -o /dev/null --max-time 10 \
+            -w '%{http_code} %{time_connect} %{time_total}' "$url"); then
+        read -r code_https t_conn t_total <<<"$out"
+        echo "HTTP $code_https · conexão ${t_conn}s · total ${t_total}s"
+        https_ok=1
+    fi
+
+    echo
+    header "Portal cativo: $portal"
+    code=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "$portal") || code=""
+    echo "HTTP ${code:-sem resposta} (esperado: 204)"
+
+    if [[ "$code" == 204 ]] && (( https_ok )); then
+        ok "Acesso web OK, sem portal cativo."
+    elif [[ -n "$code" && "$code" != 204 ]]; then
+        fail "Resposta inesperada ($code): provável portal cativo (Wi-Fi público/hotel) ou proxy interceptando."
+    elif (( https_ok )); then
+        ok "HTTPS OK (verificação de portal cativo sem resposta)."
+    else
+        fail "Sem acesso web: se os pings funcionam, um proxy ou firewall pode estar bloqueando HTTP(S)."
+    fi
+}
+
+# Rota: traceroute quando disponível, senão tracepath (iputils, não exige root)
+pane_route() {
+    if command -v traceroute >/dev/null 2>&1; then
+        traceroute -n "$1"
+    else
+        tracepath -n "$1"
+    fi
+}
+
+if [[ "${1:-}" == "--pane" ]]; then
+    kind="${2:-}"
+    shift 2 || true
+    case "$kind" in
+        gateway) pane_gateway "$@" ;;
+        dns)     pane_dns "$@" ;;
+        http)    pane_http "$@" ;;
+        route)   pane_route "$@" ;;
+        *)       echo "Painel desconhecido: $kind" >&2; exit 1 ;;
+    esac
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Configuração e criação da sessão
+# ---------------------------------------------------------------------------
+
+# Gateway da rota padrão (IPv4, senão IPv6). Imprime o IP, "sem-via" se a rota não
+# tiver gateway (VPN), "sem-rota" se não houver rota padrão, ou nada se não der para saber
+detect_gateway() {
+    local fam routes gw dest hex
+    if command -v ip >/dev/null 2>&1; then
+        for fam in -4 -6; do
+            routes=$(ip "$fam" route show default 2>/dev/null) || continue
+            [[ -n "$routes" ]] || continue
+            # Também cobre rotas multipath ("nexthop via ..."); IPv6 link-local precisa da interface
+            gw=$(awk '{
+                    via = ""; dev = ""
+                    for (i = 1; i < NF; i++) {
+                        if ($i == "via") via = $(i + 1)
+                        if ($i == "dev") dev = $(i + 1)
+                    }
+                    if (via != "") {
+                        if (via ~ /^fe80:/ && dev != "") via = via "%" dev
+                        print via
+                        exit
+                    }
+                }' <<<"$routes")
+            echo "${gw:-sem-via}"
+            return
+        done
+        echo "sem-rota"
+        return
+    fi
+    # Sem iproute2: lê a tabela IPv4 do kernel (gateway em hexadecimal little-endian).
+    # Sem rota IPv4 aqui não dá para concluir nada, pois pode haver só IPv6
+    [[ -r /proc/net/route ]] || return 0
+    while read -r _ dest hex _; do
+        [[ "$dest" == 00000000 ]] || continue
+        if [[ "$hex" == 00000000 ]]; then
+            echo "sem-via"
+        else
+            printf '%d.%d.%d.%d\n' "0x${hex:6:2}" "0x${hex:4:2}" "0x${hex:2:2}" "0x${hex:0:2}"
+        fi
+        return
+    done < <(tail -n +2 /proc/net/route)
+}
+
+# Destinos (podem ser sobrescritos por variáveis de ambiente)
+GATEWAY="${PT_GATEWAY:-$(detect_gateway)}"
+PING_1="${PT_PING_1:-1.1.1.1}"
+PING_2="${PT_PING_2:-8.8.8.8}"
+PING_DNS="${PT_PING_DNS:-google.com}"
+DNS_SERVER="${PT_DNS_SERVER:-1.1.1.1}"
+HTTP_URL="${PT_HTTP_URL:-https://www.cloudflare.com}"
+PORTAL_URL="${PT_PORTAL_URL:-http://connectivitycheck.gstatic.com/generate_204}"
+TRACE="${PT_TRACE:-8.8.8.8}"
+
+case "$GATEWAY" in
+    "")       GATEWAY_LABEL="(não detectado)" ;;
+    sem-rota) GATEWAY_LABEL="(sem rota padrão)" ;;
+    sem-via)  GATEWAY_LABEL="(rota sem gateway)" ;;
+    *)        GATEWAY_LABEL="$GATEWAY" ;;
+esac
+
+if command -v traceroute >/dev/null 2>&1; then ROUTE_TOOL="traceroute"; else ROUTE_TOOL="tracepath"; fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<EOF
+Uso: $(basename "$0")
+
+Abre a sessão tmux '$SESSION' com seis painéis de diagnóstico:
+  Gateway   ping -c5 $GATEWAY_LABEL
+  Ping      ping -c5 $PING_1
+  Ping      ping -c5 $PING_2
+  DNS       $PING_DNS pelo DNS do sistema e por @$DNS_SERVER
+  HTTP      $HTTP_URL + verificação de portal cativo
+  Rota      $ROUTE_TOOL -n $TRACE
+
+Variáveis de ambiente: PT_GATEWAY, PT_PING_1, PT_PING_2, PT_PING_DNS,
+PT_DNS_SERVER, PT_HTTP_URL, PT_PORTAL_URL, PT_TRACE
+EOF
+    exit 0
+fi
+
+# Verifica dependências obrigatórias (dig e curl são opcionais)
+missing=()
+for cmd in tmux ping; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+done
+if ! command -v traceroute >/dev/null 2>&1 && ! command -v tracepath >/dev/null 2>&1; then
+    missing+=("traceroute ou tracepath")
+fi
+if (( ${#missing[@]} )); then
+    echo "Erro: dependências ausentes: ${missing[*]}" >&2
+    echo "Consulte o README para instruções de instalação." >&2
+    exit 1
+fi
+
+# Monta o comando de um painel; ao terminar, o painel cai na shell do usuário
+pane_cmd() {
+    local cmd
+    printf -v cmd '%q ' "$@"
+    printf '%s; exec %q' "$cmd" "${SHELL:-bash}"
+}
+
+# O prefixo '=' força correspondência exata do nome da sessão
+# (sem ele, '-t pt' casaria com qualquer sessão iniciada por "pt", ex.: "ptolemy")
+TARGET="=$SESSION"
+
+# Renomeia a sessão anterior em vez de encerrá-la já: se o script estiver rodando
+# dentro dela, encerrá-la agora mataria o próprio script antes de criar a nova
+OLD=""
+if tmux has-session -t "$TARGET" 2>/dev/null; then
+    OLD="${SESSION}-old-$$"
+    tmux rename-session -t "$TARGET" "$OLD"
+fi
 
 # Cria a nova sessão e armazena os IDs únicos dos painéis (compatível com base-index 0 e 1)
-P1=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' 'ping -c5 1.1.1.1; exec bash')
-P2=$(tmux split-window -h -t "$P1" -P -F '#{pane_id}' 'ping -c5 8.8.8.8; exec bash')
-P3=$(tmux split-window -v -t "$P1" -P -F '#{pane_id}' 'ping -c5 google.com; exec bash')
-P4=$(tmux split-window -v -t "$P2" -P -F '#{pane_id}' 'traceroute 8.8.8.8; exec bash')
+if ! LAST=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' \
+        "$(pane_cmd "$SELF" --pane gateway "$GATEWAY")"); then
+    echo "Erro: não foi possível criar a sessão tmux '$SESSION'." >&2
+    [[ -n "$OLD" ]] && tmux rename-session -t "=$OLD" "$SESSION"
+    exit 1
+fi
+FIRST="$LAST"
+tmux set-option -p -t "$LAST" @pt_title "Gateway $GATEWAY_LABEL" 2>/dev/null || true
 
-# Organiza o layout em grid 2x2
-tmux select-layout -t "$SESSION" tiled 2>/dev/null || true
-tmux select-pane -t "$P1"
+# Adiciona um painel após o último e reorganiza em grade a cada passo,
+# para que a sessão (criada com tamanho padrão) sempre tenha espaço
+add_pane() {
+    local title="$1"
+    shift
+    LAST=$(tmux split-window -t "$LAST" -P -F '#{pane_id}' "$(pane_cmd "$@")")
+    tmux select-layout -t "$LAST" tiled >/dev/null
+    tmux set-option -p -t "$LAST" @pt_title "$title" 2>/dev/null || true
+}
 
-# Desativa a barra de status para exibição limpa
-tmux set-option -t "$SESSION" status off 2>/dev/null || true
+add_pane "Ping $PING_1"     ping -c5 "$PING_1"
+add_pane "Ping $PING_2"     ping -c5 "$PING_2"
+add_pane "DNS $PING_DNS"    "$SELF" --pane dns "$PING_DNS" "$DNS_SERVER"
+add_pane "HTTP"             "$SELF" --pane http "$HTTP_URL" "$PORTAL_URL"
+add_pane "Rota $TRACE ($ROUTE_TOOL)" "$SELF" --pane route "$TRACE"
 
-# Conecta à sessão
+tmux select-pane -t "$FIRST"
+
+# Desativa a barra de status e identifica cada painel na borda superior
+tmux set-option -t "$TARGET" status off >/dev/null 2>&1 || true
+tmux set-option -w -t "$TARGET:" pane-border-status top >/dev/null 2>&1 || true
+tmux set-option -w -t "$TARGET:" pane-border-format ' #{@pt_title} ' >/dev/null 2>&1 || true
+
+# Conecta à sessão e só então descarta a anterior
 if [[ -n "${TMUX:-}" ]]; then
-    tmux switch-client -t "$SESSION"
+    tmux switch-client -t "$TARGET" 2>/dev/null || true
+    # Último passo: se o script roda dentro da sessão antiga, ele termina aqui
+    [[ -n "$OLD" ]] && tmux kill-session -t "=$OLD" 2>/dev/null
+    exit 0
 else
-    tmux attach-session -t "$SESSION"
+    [[ -n "$OLD" ]] && tmux kill-session -t "=$OLD" 2>/dev/null
+    exec tmux attach-session -t "$TARGET"
 fi
