@@ -36,6 +36,12 @@ if [[ "$MODE" == "uninstall" ]]; then
     exit 0
 fi
 
+# Numa worktree do git, .git é um arquivo; os links quebram quando ela for removida
+if [[ -f "$SCRIPT_DIR/.git" ]]; then
+    echo "⚠️  $SCRIPT_DIR é uma worktree do git: os links deixam de funcionar se ela for removida." >&2
+    echo "   Prefira instalar a partir do checkout principal do repositório." >&2
+fi
+
 mkdir -p "$TARGET_DIR"
 chmod +x "$SOURCE"
 

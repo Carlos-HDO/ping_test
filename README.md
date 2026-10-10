@@ -7,7 +7,7 @@ Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` co
 ## ⚡ Funcionalidades
 
 - **Painel em `tmux`**: seis painéis em grade, cada um identificado por título na borda.
-- **Gateway local**: detectado automaticamente; separa falha no Wi-Fi/cabo de falha no provedor.
+- **Gateway local**: detectado automaticamente (IPv4 ou IPv6); separa falha no Wi-Fi/cabo de falha no provedor.
 - **Conectividade**: `ping` para `1.1.1.1` e `8.8.8.8`.
 - **DNS**: compara o resolvedor do sistema com um DNS externo (`@1.1.1.1`) e distingue resolvedor quebrado, DNS bloqueado e nome inexistente.
 - **HTTP/HTTPS**: funciona mesmo onde ICMP é bloqueado e detecta portal cativo ou proxy interceptando.
@@ -54,7 +54,8 @@ cd ping_test
 O instalador cria os links `pt` e `pingtest` em `~/.local/bin`, apontando para o script do repositório (por isso, mantenha o repositório no lugar ou reinstale após movê-lo). Ele também:
 
 - **não sobrescreve** comandos `pt`/`pingtest` já existentes que não sejam do ping_test (use `./install.sh --force` para sobrescrever);
-- avisa se `~/.local/bin` não estiver no `PATH`, ou se outro comando com o mesmo nome tiver prioridade.
+- avisa se `~/.local/bin` não estiver no `PATH`, ou se outro comando com o mesmo nome tiver prioridade;
+- avisa se for executado a partir de uma worktree do git, cujos links quebram quando ela é removida.
 
 Se necessário, adicione `~/.local/bin` ao `PATH` no `~/.zshrc` ou `~/.bashrc`:
 
@@ -90,7 +91,7 @@ PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 
 | Variável | Padrão | Uso |
 | :--- | :--- | :--- |
-| `PT_GATEWAY` | detectado via `ip route` | Gateway local |
+| `PT_GATEWAY` | detectado via `ip route` (ou `/proc/net/route`) | Gateway local; defina se não for detectado |
 | `PT_PING_1` | `1.1.1.1` | Ping 1 |
 | `PT_PING_2` | `8.8.8.8` | Ping 2 |
 | `PT_PING_DNS` | `google.com` | Nome consultado no painel DNS |
