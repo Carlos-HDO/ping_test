@@ -14,6 +14,11 @@ header() { printf '== %s ==\n' "$*"; }
 ok()     { printf '\n✅ %s\n' "$*"; }
 fail()   { printf '\n❌ %s\n' "$*"; }
 info()   { printf '\nℹ️  %s\n' "$*"; }
+warn()   { printf '\n⚠️  %s\n' "$*"; }
+
+# Comparação e formatação de decimais (o bash só lida com inteiros)
+gt()  { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+num() { local v; v=$(awk -v x="$1" 'BEGIN { printf "%.1f", x }'); echo "${v/./,}"; }
 
 # Gateway local: separa problema na rede local (Wi-Fi/cabo) de problema no provedor
 pane_gateway() {
@@ -131,6 +136,46 @@ pane_http() {
     fi
 }
 
+# Internet via ICMP: além de responder, avalia perda, latência média e oscilação (jitter)
+pane_ping() {
+    local host="$1" slow="$2" very_slow="$3" jitter_max="$4" out loss stats min avg max mdev
+    local -a issues=()
+
+    header "Ping: $host"
+    # Mostra as respostas ao vivo e guarda a saída para o veredito (LC_ALL=C: formato previsível)
+    out=$(LC_ALL=C ping -c5 "$host" | tee /dev/stderr) || true
+    loss=$(sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' <<<"$out")
+    stats=$(sed -n 's/^rtt [^=]*= \([0-9.\/]*\) ms.*/\1/p' <<<"$out")
+
+    if [[ -z "$stats" ]]; then
+        fail "Sem resposta de $host: sem internet ou ICMP bloqueado (compare com o painel HTTP)."
+        return
+    fi
+    IFS=/ read -r min avg max mdev <<<"$stats"
+    printf '\nPerda %s%% · média %s ms · mín %s · máx %s · variação %s ms\n' \
+        "${loss:-?}" "$(num "$avg")" "$(num "$min")" "$(num "$max")" "$(num "$mdev")"
+
+    if gt "$avg" "$very_slow"; then
+        issues+=("muito lenta (média $(num "$avg") ms, acima de $very_slow ms)")
+    elif gt "$avg" "$slow"; then
+        issues+=("um pouco lenta (média $(num "$avg") ms, ideal até $slow ms)")
+    fi
+    if gt "${loss:-0}" 0; then
+        issues+=("perdendo pacotes (${loss}%)")
+    fi
+    if gt "$mdev" "$jitter_max"; then
+        issues+=("oscilando (variação de $(num "$mdev") ms, pico de $(num "$max") ms)")
+    fi
+
+    if (( ${#issues[@]} == 0 )); then
+        ok "Internet OK: média $(num "$avg") ms, sem perda de pacotes."
+    else
+        local msg
+        msg=$(printf '%s; ' "${issues[@]}")
+        warn "Internet funcionando, mas ${msg%; }."
+    fi
+}
+
 # Rota: traceroute quando disponível, senão tracepath (iputils, não exige root)
 pane_route() {
     if command -v traceroute >/dev/null 2>&1; then
@@ -145,6 +190,7 @@ if [[ "${1:-}" == "--pane" ]]; then
     shift 2 || true
     case "$kind" in
         gateway) pane_gateway "$@" ;;
+        ping)    pane_ping "$@" ;;
         dns)     pane_dns "$@" ;;
         http)    pane_http "$@" ;;
         route)   pane_route "$@" ;;
@@ -208,6 +254,12 @@ HTTP_URL="${PT_HTTP_URL:-https://www.cloudflare.com}"
 PORTAL_URL="${PT_PORTAL_URL:-http://connectivitycheck.gstatic.com/generate_204}"
 TRACE="${PT_TRACE:-8.8.8.8}"
 
+# Limites de latência em ms para os painéis de ping (inteiros; valor inválido usa o padrão)
+int_or() { [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo "$2"; }
+LAT_SLOW=$(int_or "${PT_LAT_SLOW:-}" 60)
+LAT_VERY_SLOW=$(int_or "${PT_LAT_VERY_SLOW:-}" 150)
+JITTER_MAX=$(int_or "${PT_JITTER:-}" 30)
+
 case "$GATEWAY" in
     "")       GATEWAY_LABEL="(não detectado)" ;;
     sem-rota) GATEWAY_LABEL="(sem rota padrão)" ;;
@@ -229,8 +281,12 @@ Abre a sessão tmux '$SESSION' com seis painéis de diagnóstico:
   HTTP      $HTTP_URL + verificação de portal cativo
   Rota      $ROUTE_TOOL -n $TRACE
 
+Latência nos pings: OK até ${LAT_SLOW} ms, muito lenta acima de ${LAT_VERY_SLOW} ms,
+oscilando com variação acima de ${JITTER_MAX} ms.
+
 Variáveis de ambiente: PT_GATEWAY, PT_PING_1, PT_PING_2, PT_PING_DNS,
-PT_DNS_SERVER, PT_HTTP_URL, PT_PORTAL_URL, PT_TRACE
+PT_DNS_SERVER, PT_HTTP_URL, PT_PORTAL_URL, PT_TRACE,
+PT_LAT_SLOW, PT_LAT_VERY_SLOW, PT_JITTER
 EOF
     exit 0
 fi
@@ -288,8 +344,8 @@ add_pane() {
     tmux set-option -p -t "$LAST" @pt_title "$title" 2>/dev/null || true
 }
 
-add_pane "Ping $PING_1"     ping -c5 "$PING_1"
-add_pane "Ping $PING_2"     ping -c5 "$PING_2"
+add_pane "Ping $PING_1"     "$SELF" --pane ping "$PING_1" "$LAT_SLOW" "$LAT_VERY_SLOW" "$JITTER_MAX"
+add_pane "Ping $PING_2"     "$SELF" --pane ping "$PING_2" "$LAT_SLOW" "$LAT_VERY_SLOW" "$JITTER_MAX"
 add_pane "DNS $PING_DNS"    "$SELF" --pane dns "$PING_DNS" "$DNS_SERVER"
 add_pane "HTTP"             "$SELF" --pane http "$HTTP_URL" "$PORTAL_URL"
 add_pane "Rota $TRACE ($ROUTE_TOOL)" "$SELF" --pane route "$TRACE"
