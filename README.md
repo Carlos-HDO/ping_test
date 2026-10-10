@@ -8,11 +8,11 @@ Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` co
 
 - **Painel em `tmux`**: seis painéis em grade, cada um identificado por título na borda.
 - **Gateway local**: detectado automaticamente (IPv4 ou IPv6); separa falha no Wi-Fi/cabo de falha no provedor.
-- **Conectividade**: `ping` para `1.1.1.1` e `8.8.8.8`.
+- **Conectividade**: `ping` para `1.1.1.1` e `8.8.8.8`, avaliando perda de pacotes, latência média e oscilação (jitter): aponta quando a internet funciona, mas está lenta ou instável.
 - **DNS**: compara o resolvedor do sistema com um DNS externo (`@1.1.1.1`) e distingue resolvedor quebrado, DNS bloqueado e nome inexistente.
 - **HTTP/HTTPS**: funciona mesmo onde ICMP é bloqueado e detecta portal cativo ou proxy interceptando.
 - **Rota**: `traceroute -n` ou, na falta dele, `tracepath -n` (não exige root).
-- **Vereditos**: os painéis de gateway, DNS e HTTP terminam com uma conclusão (✅/❌).
+- **Vereditos**: todos os painéis, exceto o de rota, terminam com uma conclusão (✅ OK, ⚠️ funcionando com problemas, ❌ falha).
 - **Reexecução segura**: substitui apenas a sessão chamada exatamente `pt`, inclusive quando executada de dentro dela.
 - **Destinos configuráveis** por variáveis de ambiente.
 
@@ -99,6 +99,9 @@ PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 | `PT_HTTP_URL` | `https://www.cloudflare.com` | Teste HTTPS |
 | `PT_PORTAL_URL` | `http://connectivitycheck.gstatic.com/generate_204` | Detecção de portal cativo (espera HTTP 204) |
 | `PT_TRACE` | `8.8.8.8` | Rota |
+| `PT_LAT_SLOW` | `60` | Latência média (ms) acima da qual o ping é "um pouco lento" |
+| `PT_LAT_VERY_SLOW` | `150` | Latência média (ms) acima da qual o ping é "muito lento" |
+| `PT_JITTER` | `30` | Variação (ms) acima da qual a latência é considerada oscilante |
 
 ### Encerrar ou desconectar da sessão
 
@@ -116,8 +119,8 @@ tmux kill-session -t =pt
 | Painel | O que faz |
 | :--- | :--- |
 | Gateway | `ping -c5` no gateway padrão |
-| Ping 1.1.1.1 | `ping -c5 1.1.1.1` |
-| Ping 8.8.8.8 | `ping -c5 8.8.8.8` |
+| Ping 1.1.1.1 | `ping -c5 1.1.1.1` + resumo de perda, latência e oscilação |
+| Ping 8.8.8.8 | `ping -c5 8.8.8.8` + resumo de perda, latência e oscilação |
 | DNS | `getent hosts` (sistema) × `dig @1.1.1.1` (externo) + `ping -c3` por nome |
 | HTTP | `curl` em HTTPS + verificação de portal cativo |
 | Rota | `traceroute -n 8.8.8.8` (ou `tracepath -n`) |
@@ -128,6 +131,8 @@ tmux kill-session -t =pt
 | :--- | :--- |
 | Gateway ❌ | Rede local: Wi-Fi, cabo, roteador ou DHCP |
 | Gateway ✅, pings ❌ | Provedor de internet |
+| Pings ⚠️ lenta/oscilando | Congestionamento: Wi-Fi fraco, rede local ocupada (downloads, streaming) ou provedor sobrecarregado; se o gateway também estiver lento, o problema é local |
+| Pings ⚠️ perdendo pacotes | Conexão instável: sinal Wi-Fi, cabo ou provedor |
 | Pings ✅, DNS ❌ (externo responde) | Resolvedor configurado (roteador ou `/etc/resolv.conf`) |
 | Pings ❌, HTTP ✅ | ICMP bloqueado na rede; a internet funciona |
 | HTTP ❌ com resposta inesperada | Portal cativo (Wi-Fi público/hotel) ou proxy |
