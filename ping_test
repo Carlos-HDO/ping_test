@@ -16,6 +16,44 @@ fail()   { printf '\n❌ %s\n' "$*"; }
 info()   { printf '\nℹ️  %s\n' "$*"; }
 warn()   { printf '\n⚠️  %s\n' "$*"; }
 
+# Dica de correção: causa mais provável + comandos (itens iniciados por '#' são comentários)
+fix() {
+    local why="$1" line
+    shift
+    printf '\n💡 Most likely fix: %s\n' "$why"
+    for line in "$@"; do
+        if [[ "$line" == '#'* ]]; then printf '     %s\n' "$line"; else printf '     $ %s\n' "$line"; fi
+    done
+}
+
+# Comando de instalação das ferramentas (tmux, ping, traceroute, dig, curl) no gerenciador de pacotes do sistema
+install_hint() {
+    local tool pkg mgr pkgs=""
+    if   command -v apt-get >/dev/null 2>&1; then mgr="sudo apt update && sudo apt install -y"
+    elif command -v pacman  >/dev/null 2>&1; then mgr="sudo pacman -S"
+    elif command -v dnf     >/dev/null 2>&1; then mgr="sudo dnf install"
+    elif command -v zypper  >/dev/null 2>&1; then mgr="sudo zypper install"
+    elif command -v apk     >/dev/null 2>&1; then mgr="sudo apk add"
+    else
+        echo "# Install $* with your distribution's package manager"
+        return
+    fi
+    for tool in "$@"; do
+        case "$tool" in
+            ping)
+                if command -v apt-get >/dev/null 2>&1; then pkg="iputils-ping"; else pkg="iputils"; fi ;;
+            dig)
+                if   command -v apt-get >/dev/null 2>&1; then pkg="dnsutils"
+                elif command -v pacman  >/dev/null 2>&1; then pkg="bind"
+                elif command -v apk     >/dev/null 2>&1; then pkg="bind-tools"
+                else pkg="bind-utils"; fi ;;
+            *) pkg="$tool" ;;
+        esac
+        pkgs+=" $pkg"
+    done
+    echo "$mgr$pkgs"
+}
+
 # Comparação e formatação de decimais (o bash só lida com inteiros)
 gt()  { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
 num() { awk -v x="$1" 'BEGIN { printf "%.1f", x }'; }
@@ -26,9 +64,18 @@ pane_gateway() {
     case "$gw" in
         "")
             info "Could not detect the gateway. Set PT_GATEWAY=<ip> to test it."
+            fix "the default route could not be read; find the router IP yourself and pass it in." \
+                "ip route show default" \
+                "# Then use the address after 'via', for example:" \
+                "PT_GATEWAY=192.168.0.1 pt"
             return ;;
         no-route)
             fail "No default route: no connection to the local network (Wi-Fi, cable or DHCP)."
+            fix "the interface is down, Wi-Fi is off or DHCP did not assign an address; reconnect and restart the network service." \
+                "nmcli device status" \
+                "nmcli radio wifi on" \
+                "sudo systemctl restart NetworkManager" \
+                "# Still nothing? Check the cable, then power-cycle the router."
             return ;;
         no-via)
             info "Default route has no gateway (VPN or point-to-point link); test does not apply."
@@ -39,6 +86,11 @@ pane_gateway() {
         ok "Local network OK."
     else
         fail "Gateway not responding: local network problem (some routers block ICMP; compare with the other panes)."
+        fix "weak Wi-Fi signal, bad cable or a router that needs a restart; check the link, then power-cycle the router." \
+            "ip neigh show ${gw%%\%*}   # FAILED or INCOMPLETE means the router is not answering" \
+            "nmcli -f IN-USE,SSID,SIGNAL,CHAN dev wifi list   # Wi-Fi only: signal below ~40 is weak" \
+            "sudo systemctl restart NetworkManager" \
+            "# If other panes work fine, the router probably just blocks ICMP: ignore this one."
     fi
 }
 
@@ -80,6 +132,7 @@ pane_dns() {
         fi
     else
         echo "(dig not found: install dnsutils/bind-utils for this test)"
+        fix "dig is not installed, so the external DNS test cannot run." "$(install_hint dig)"
     fi
 
     echo
@@ -90,14 +143,30 @@ pane_dns() {
         ok "System DNS OK."
     elif [[ "$ext" == nx ]]; then
         fail "The name $host does not exist (NXDOMAIN): check the target in PT_PING_DNS."
+        fix "the name is misspelled or not registered; test with a known-good one." \
+            "PT_PING_DNS=example.com pt"
     elif [[ "$ext" == ok && "$sys" == error ]]; then
         fail "System DNS failed, but the external one responds: problem with the configured resolver (router DNS or /etc/resolv.conf)."
+        fix "the configured resolver is broken or stale; restart it and flush its cache, or switch to a public DNS." \
+            "resolvectl status   # shows which DNS server each interface uses" \
+            "sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches" \
+            "nmcli connection show   # find your connection name, then:" \
+            "nmcli connection modify \"<connection>\" ipv4.dns \"$server 8.8.8.8\" ipv4.ignore-auto-dns yes" \
+            "nmcli connection up \"<connection>\""
     elif [[ "$ext" == ok ]]; then
         ok "External DNS OK (system DNS not tested)."
     elif [[ "$ext" == error ]]; then
         fail "No DNS server responded: no internet or port 53 blocked."
+        fix "if the ping panes work, outbound DNS (port 53) is probably filtered; try another server or DNS over TCP." \
+            "dig +tcp +time=3 @$server $host" \
+            "PT_DNS_SERVER=9.9.9.9 pt" \
+            "# If the ping panes fail too, fix the connection first (see the Gateway pane)."
     elif [[ "$sys" == error ]]; then
         fail "System DNS failed."
+        fix "the configured resolver is not answering; restart it and check its settings." \
+            "resolvectl status" \
+            "sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches" \
+            "cat /etc/resolv.conf"
     else
         info "Neither getent nor dig available: see the ping by name result above."
     fi
@@ -105,16 +174,18 @@ pane_dns() {
 
 # HTTP(S): funciona mesmo onde ICMP é bloqueado e detecta portal cativo/proxy
 pane_http() {
-    local url="$1" portal="$2" out code="" code_https t_conn t_total https_ok=0
+    local url="$1" portal="$2" out code="" code_https t_conn t_total https_ok=0 rc=0
 
     if ! command -v curl >/dev/null 2>&1; then
         fail "curl not found: install curl for this test."
+        fix "curl is not installed, so the HTTP test cannot run." "$(install_hint curl)"
         return
     fi
 
     header "HTTPS: $url"
-    if out=$(curl -sS -o /dev/null --max-time 10 \
-            -w '%{http_code} %{time_connect} %{time_total}' "$url"); then
+    out=$(curl -sS -o /dev/null --max-time 10 \
+            -w '%{http_code} %{time_connect} %{time_total}' "$url") || rc=$?
+    if (( rc == 0 )); then
         read -r code_https t_conn t_total <<<"$out"
         echo "HTTP $code_https · connect ${t_conn}s · total ${t_total}s"
         https_ok=1
@@ -129,10 +200,30 @@ pane_http() {
         ok "Web access OK, no captive portal."
     elif [[ -n "$code" && "$code" != 204 ]]; then
         fail "Unexpected response ($code): likely a captive portal (public/hotel Wi-Fi) or an intercepting proxy."
+        fix "the network wants you to sign in or accept terms first; open a plain-HTTP page to trigger the login screen." \
+            "xdg-open http://neverssl.com" \
+            "# On a trusted network with no login page, look for a proxy instead:" \
+            "env | grep -i proxy"
     elif (( https_ok )); then
         ok "HTTPS OK (captive portal check got no response)."
     else
         fail "No web access: if pings work, a proxy or firewall may be blocking HTTP(S)."
+        case "$rc" in
+            6)
+                fix "the host name could not be resolved; this is a DNS problem (see the DNS pane)." \
+                    "resolvectl status" \
+                    "sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches" ;;
+            35|51|58|59|60|77|83)
+                fix "TLS/certificate error: usually a wrong system clock, or a network that intercepts HTTPS." \
+                    "timedatectl   # check that the time and 'System clock synchronized' are right" \
+                    "sudo timedatectl set-ntp true" \
+                    "curl -v $url   # shows which certificate was presented" ;;
+            *)
+                fix "connection refused or timed out: a proxy setting, firewall or a down connection." \
+                    "env | grep -i proxy   # unset any stale proxy variable, e.g.: unset https_proxy" \
+                    "curl -v $url" \
+                    "# If pings fail too, fix the connection first (see the Gateway pane)." ;;
+        esac
     fi
 }
 
@@ -149,6 +240,10 @@ pane_ping() {
 
     if [[ -z "$stats" ]]; then
         fail "No reply from $host: no internet or ICMP blocked (compare with the HTTP pane)."
+        fix "if the HTTP pane works, ICMP is just blocked and nothing needs fixing; otherwise the provider link is down." \
+            "curl -sI https://www.cloudflare.com | head -n1   # works? then only ping is blocked" \
+            "ip route show default && ping -c3 \"\$(ip route show default | awk '{print \$3; exit}')\"" \
+            "# Gateway fine but no internet: restart the modem/router, then call your ISP."
         return
     fi
     IFS=/ read -r min avg max mdev <<<"$stats"
@@ -173,6 +268,10 @@ pane_ping() {
         local msg
         msg=$(printf '%s; ' "${issues[@]}")
         warn "Internet working, but ${msg%; }."
+        fix "an unstable or congested link; check Wi-Fi signal and errors on the interface, and stop heavy transfers." \
+            "nmcli -f IN-USE,SSID,SIGNAL,CHAN dev wifi list   # Wi-Fi only: prefer signal above ~60" \
+            "ip -s link   # look for growing errors/dropped counters" \
+            "# Use a cable or the 5 GHz band if possible; if the Gateway pane is also slow, the problem is local."
     fi
 }
 
@@ -301,7 +400,11 @@ if ! command -v traceroute >/dev/null 2>&1 && ! command -v tracepath >/dev/null 
 fi
 if (( ${#missing[@]} )); then
     echo "Error: missing dependencies: ${missing[*]}" >&2
-    echo "See the README for installation instructions." >&2
+    echo "" >&2
+    echo "💡 Most likely fix: install the missing packages." >&2
+    hint=$(install_hint "${missing[@]/traceroute or tracepath/traceroute}")
+    if [[ "$hint" == '#'* ]]; then echo "     $hint" >&2; else echo "     \$ $hint" >&2; fi
+    echo "   See the README for other distributions." >&2
     exit 1
 fi
 
@@ -328,6 +431,12 @@ fi
 if ! LAST=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' \
         "$(pane_cmd "$SELF" --pane gateway "$GATEWAY")"); then
     echo "Error: could not create the tmux session '$SESSION'." >&2
+    echo "" >&2
+    echo "💡 Most likely fix: a broken or stale tmux server/socket; inspect it first." >&2
+    echo "     \$ tmux ls" >&2
+    echo "     \$ tmux -V" >&2
+    echo "     # Last resort (closes ALL your tmux sessions):" >&2
+    echo "     \$ tmux kill-server" >&2
     [[ -n "$OLD" ]] && tmux rename-session -t "=$OLD" "$SESSION"
     exit 1
 fi

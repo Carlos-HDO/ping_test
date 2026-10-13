@@ -13,6 +13,7 @@ Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` co
 - **HTTP/HTTPS**: funciona mesmo onde ICMP é bloqueado e detecta portal cativo ou proxy interceptando.
 - **Rota**: `traceroute -n` ou, na falta dele, `tracepath -n` (não exige root).
 - **Vereditos**: todos os painéis, exceto o de rota, terminam com uma conclusão (✅ OK, ⚠️ funcionando com problemas, ❌ falha).
+- **Dicas de correção**: cada falha ou alerta termina com `💡 Most likely fix`, a causa mais provável e os comandos para resolver (em inglês). Dependências ausentes mostram o comando de instalação da sua distribuição (apt, pacman, dnf, zypper ou apk).
 - **Reexecução segura**: substitui apenas a sessão chamada exatamente `pt`, inclusive quando executada de dentro dela.
 - **Destinos configuráveis** por variáveis de ambiente.
 - **Mensagens em inglês**: a saída da ferramenta (painéis, vereditos, `--help` e instalador) é exibida em inglês.
@@ -125,6 +126,20 @@ tmux kill-session -t =pt
 | DNS | `getent hosts` (sistema) × `dig @1.1.1.1` (externo) + `ping -c3` por nome |
 | HTTP | `curl` em HTTPS + verificação de portal cativo |
 | Route | `traceroute -n 8.8.8.8` (ou `tracepath -n`) |
+
+### Dicas de correção
+
+Quando um painel conclui com ❌ ou ⚠️, ele imprime a solução mais provável com os comandos prontos para copiar:
+
+```text
+❌ System DNS failed, but the external one responds: problem with the configured resolver (...).
+
+💡 Most likely fix: the configured resolver is broken or stale; restart it and flush its cache, or switch to a public DNS.
+     $ resolvectl status   # shows which DNS server each interface uses
+     $ sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches
+```
+
+No painel HTTP a dica depende do erro do `curl`: falha de DNS, certificado/relógio, ou conexão recusada/proxy. Os comandos assumem `NetworkManager` e `systemd-resolved` (o padrão em Debian, Ubuntu, Fedora e derivadas); em outros sistemas, adapte-os.
 
 ### Como ler o resultado
 
