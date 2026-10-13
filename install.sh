@@ -58,6 +58,10 @@ done
 
 if (( ${#installed[@]} == 0 )); then
     echo "Nothing was installed." >&2
+    echo "" >&2
+    echo "💡 Most likely fix: other commands named pt/pingtest are in the way. Check them, then overwrite if they are not needed:" >&2
+    echo "     \$ ls -l $TARGET_DIR/pt $TARGET_DIR/pingtest" >&2
+    echo "     \$ ./install.sh --force" >&2
     exit 1
 fi
 
@@ -79,7 +83,9 @@ case ":$PATH:" in
         ;;
     *)
         echo ""
-        echo "⚠️  $TARGET_DIR is not in PATH. Add this to ~/.zshrc or ~/.bashrc:"
-        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "⚠️  $TARGET_DIR is not in PATH."
+        echo "💡 Most likely fix: add it to your shell profile and reload it:"
+        echo "     \$ echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.\$(basename \"\$SHELL\")rc"
+        echo "     \$ exec \"\$SHELL\""
         ;;
 esac

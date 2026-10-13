@@ -13,7 +13,9 @@ Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` co
 - **HTTP/HTTPS**: funciona mesmo onde ICMP é bloqueado e detecta portal cativo ou proxy interceptando.
 - **Rota**: `traceroute -n` ou, na falta dele, `tracepath -n` (não exige root).
 - **Vereditos**: todos os painéis, exceto o de rota, terminam com uma conclusão (✅ OK, ⚠️ funcionando com problemas, ❌ falha).
+- **Dicas de correção**: cada falha ou alerta termina com `💡 Most likely fix`, a causa mais provável e os comandos para resolver (em inglês). Dependências ausentes mostram o comando de instalação da sua distribuição (apt, pacman, dnf, zypper ou apk).
 - **Reexecução segura**: substitui apenas a sessão chamada exatamente `pt`, inclusive quando executada de dentro dela.
+- **Modo avançado (`-a`)**: abre mais duas abas no `tmux`, com sinal Wi-Fi/cabo, IPv6, MTU, velocidade do DNS, portas bloqueadas, perda por salto (MTR), CGNAT, velocidade e bufferbloat.
 - **Destinos configuráveis** por variáveis de ambiente.
 - **Mensagens em inglês**: a saída da ferramenta (painéis, vereditos, `--help` e instalador) é exibida em inglês.
 
@@ -22,24 +24,24 @@ Uma ferramenta leve de diagnóstico de rede em Bash que abre um painel `tmux` co
 ## 📦 Dependências
 
 - **Obrigatórias**: `tmux`, `ping` e `traceroute` **ou** `tracepath`.
-- **Opcionais**: `dig` (teste com DNS externo) e `curl` (teste HTTP). Sem elas, o painel correspondente avisa o que instalar.
+- **Opcionais**: `dig` (teste com DNS externo) e `curl` (teste HTTP); no modo avançado, também `mtr`. Sem elas, o painel correspondente mostra o comando de instalação.
 
 ### Debian / Ubuntu / Kali / Pop!_OS
 
 ```bash
-sudo apt update && sudo apt install -y tmux iputils-ping traceroute dnsutils curl
+sudo apt update && sudo apt install -y tmux iputils-ping traceroute dnsutils curl mtr
 ```
 
 ### Arch Linux / Manjaro
 
 ```bash
-sudo pacman -S tmux iputils traceroute bind curl
+sudo pacman -S tmux iputils traceroute bind curl mtr
 ```
 
 ### Fedora
 
 ```bash
-sudo dnf install tmux iputils traceroute bind-utils curl
+sudo dnf install tmux iputils traceroute bind-utils curl mtr
 ```
 
 ---
@@ -79,6 +81,7 @@ Para desinstalar (remove apenas os links que apontam para o ping_test):
 ```bash
 pt              # após a instalação
 ./ping_test     # ou direto da raiz do repositório
+pt -a           # modo avançado: abas extras com testes mais completos
 pt --help       # mostra destinos e opções
 ```
 
@@ -103,6 +106,8 @@ PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 | `PT_LAT_SLOW` | `60` | Latência média (ms) acima da qual o ping é "a bit slow" |
 | `PT_LAT_VERY_SLOW` | `150` | Latência média (ms) acima da qual o ping é "very slow" |
 | `PT_JITTER` | `30` | Variação (ms) acima da qual a latência é considerada oscilante |
+| `PT_SPEED_SECONDS` | `8` | Duração (s) de cada sentido do teste de velocidade no modo `-a`; `0` desativa a aba |
+| `PT_SPEED_DELAY` | `30` | Espera (s) antes do teste de velocidade, para não distorcer os outros painéis (Enter inicia na hora) |
 
 ### Encerrar ou desconectar da sessão
 
@@ -110,7 +115,7 @@ PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 # Desconecte sem interromper os comandos: Ctrl+b, depois d
 
 # Encerre a sessão e todos os seus painéis
-tmux kill-session -t =pt
+tmux kill-session -t '=pt'   # aspas: no zsh, =pt vira o caminho do comando pt
 ```
 
 ---
@@ -126,6 +131,36 @@ tmux kill-session -t =pt
 | HTTP | `curl` em HTTPS + verificação de portal cativo |
 | Route | `traceroute -n 8.8.8.8` (ou `tracepath -n`) |
 
+### Modo avançado (`pt -a`)
+
+Além da aba `basic`, abre mais duas abas. Para alternar entre elas, use `Ctrl+b n` (próxima) e `Ctrl+b p` (anterior).
+
+| Aba | Painel | O que faz |
+| :--- | :--- | :--- |
+| `advanced` | Interface | Sinal do Wi-Fi (dBm, canal, banda) ou velocidade negociada no cabo, e taxa de erros da interface |
+| | Public IP / IPv6 | IP público e país; detecta IPv6 ausente ou quebrado (endereço sem rota) |
+| | MTU | MTU do caminho até `PT_PING_1` por busca binária; aponta PPPoE, VPN ou túnel |
+| | DNS speed | Tempo de resposta do DNS do sistema (o upstream real, não o cache `127.0.0.53`) × 1.1.1.1, 8.8.8.8 e 9.9.9.9 |
+| | Ports | Portas TCP de saída (53, 853, 80, 443, 22, 587, 993, 25) e QUIC/HTTP3; detecta firewall |
+| | MTR | Perda por salto até `PT_TRACE`, indicando se começa no roteador, no provedor ou além; detecta CGNAT e NAT duplo |
+| `speed` | Speed and bufferbloat | Download e upload (4 conexões, speed.cloudflare.com) e o aumento da latência sob carga, com nota de A+ a F |
+
+> O teste de velocidade consome dados: até algumas centenas de MB em conexões rápidas. Em redes limitadas, use `PT_SPEED_SECONDS=0 pt -a`.
+
+### Dicas de correção
+
+Quando um painel conclui com ❌ ou ⚠️, ele imprime a solução mais provável com os comandos prontos para copiar:
+
+```text
+❌ System DNS failed, but the external one responds: problem with the configured resolver (...).
+
+💡 Most likely fix: the configured resolver is broken or stale; restart it and flush its cache, or switch to a public DNS.
+     $ resolvectl status   # shows which DNS server each interface uses
+     $ sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches
+```
+
+No painel HTTP a dica depende do erro do `curl`: falha de DNS, certificado/relógio, ou conexão recusada/proxy. Os comandos assumem `NetworkManager` e `systemd-resolved` (o padrão em Debian, Ubuntu, Fedora e derivadas); em outros sistemas, adapte-os.
+
 ### Como ler o resultado
 
 | Sintoma | Provável causa |
@@ -137,6 +172,9 @@ tmux kill-session -t =pt
 | Pings ✅, DNS ❌ (externo responde) | Resolvedor configurado (roteador ou `/etc/resolv.conf`) |
 | Pings ❌, HTTP ✅ | ICMP bloqueado na rede; a internet funciona |
 | HTTP ❌ com resposta inesperada | Portal cativo (Wi-Fi público/hotel) ou proxy |
+| MTR: perda só em saltos intermediários | Roteadores limitando respostas ICMP; não é perda real |
+| Bufferbloat C ou pior | Roteador sem controle de fila: ative SQM/QoS (fq_codel ou CAKE) |
+| CGNAT detectado | Sem IPv4 público: redirecionamento de portas não funciona |
 
 ---
 
