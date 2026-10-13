@@ -58,6 +58,23 @@ install_hint() {
 gt()  { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
 num() { awk -v x="$1" 'BEGIN { printf "%.1f", x }'; }
 
+# Interface usada para chegar à internet (IPv4, senão IPv6)
+default_iface() {
+    command -v ip >/dev/null 2>&1 || return 0
+    { ip route get 1.1.1.1 || ip -6 route get 2606:4700:4700::1111; } 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# Nome da conexão ativa do NetworkManager na interface (para as dicas com nmcli)
+nm_conn() {
+    local dev="${1:-$(default_iface)}" name=""
+    if [[ -n "$dev" ]] && command -v nmcli >/dev/null 2>&1; then
+        name=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null |
+            awk -F: -v d="$dev" '$NF == d { sub(/:[^:]*$/, ""); print; exit }')
+    fi
+    echo "${name:-<connection>}"
+}
+
 # Gateway local: separa problema na rede local (Wi-Fi/cabo) de problema no provedor
 pane_gateway() {
     local gw="${1:-}"
@@ -147,12 +164,13 @@ pane_dns() {
             "PT_PING_DNS=example.com pt"
     elif [[ "$ext" == ok && "$sys" == error ]]; then
         fail "System DNS failed, but the external one responds: problem with the configured resolver (router DNS or /etc/resolv.conf)."
+        local conn
+        conn=$(nm_conn)
         fix "the configured resolver is broken or stale; restart it and flush its cache, or switch to a public DNS." \
             "resolvectl status   # shows which DNS server each interface uses" \
             "sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches" \
-            "nmcli connection show   # find your connection name, then:" \
-            "nmcli connection modify \"<connection>\" ipv4.dns \"$server 8.8.8.8\" ipv4.ignore-auto-dns yes" \
-            "nmcli connection up \"<connection>\""
+            "nmcli connection modify \"$conn\" ipv4.dns \"$server 8.8.8.8\" ipv4.ignore-auto-dns yes" \
+            "nmcli connection up \"$conn\""
     elif [[ "$ext" == ok ]]; then
         ok "External DNS OK (system DNS not tested)."
     elif [[ "$ext" == error ]]; then
@@ -284,6 +302,533 @@ pane_route() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Painéis avançados (opção -a)
+# ---------------------------------------------------------------------------
+
+# Interface: sinal do Wi-Fi ou velocidade negociada no cabo, e erros de transmissão
+pane_iface() {
+    local dev sys conn line signal="" chan="" rate="" ssid="" dbm="" speed="" duplex="" kind
+    local rx tx errs drops
+    local -a issues=()
+
+    dev=$(default_iface)
+    if [[ -z "$dev" ]]; then
+        fail "No interface routes to the internet: not connected."
+        fix "the interface is down, Wi-Fi is off or DHCP did not assign an address; reconnect and restart the network service." \
+            "nmcli device status" \
+            "nmcli radio wifi on" \
+            "sudo systemctl restart NetworkManager"
+        return
+    fi
+    sys="/sys/class/net/$dev"
+    conn=$(nm_conn "$dev")
+
+    header "Interface: $dev"
+    ip -br addr show dev "$dev" 2>/dev/null || true
+    printf 'MTU %s · MAC %s\n' "$(cat "$sys/mtu" 2>/dev/null)" "$(cat "$sys/address" 2>/dev/null)"
+    echo
+
+    if [[ -d "$sys/wireless" || -d "$sys/phy80211" ]]; then
+        kind="wifi"
+        header "Wi-Fi"
+        # Nível do sinal em dBm: 4ª coluna de /proc/net/wireless (ex.: "-52.")
+        dbm=$(awk -v d="$dev:" '$1 == d { sub(/\.$/, "", $4); print $4 }' /proc/net/wireless 2>/dev/null) || dbm=""
+        if command -v nmcli >/dev/null 2>&1; then
+            # Formato: "*:SINAL:CANAL:TAXA:SSID" (o SSID fica por último porque pode conter ':' escapado)
+            line=$(nmcli -t -f IN-USE,SIGNAL,CHAN,RATE,SSID dev wifi list ifname "$dev" --rescan no 2>/dev/null |
+                grep -m1 '^\*:') || line=""
+            if [[ -n "$line" ]]; then
+                IFS=: read -r _ signal chan rate _ <<<"$line"
+                ssid=$(cut -d: -f5- <<<"$line")
+                ssid=${ssid//\\:/:}
+            fi
+        fi
+        printf 'SSID %s · signal %s%s · channel %s (%s) · rate %s\n' \
+            "${ssid:-?}" "${dbm:+$dbm dBm }" "${signal:+($signal%)}" "${chan:-?}" \
+            "$( [[ "$chan" =~ ^[0-9]+$ ]] && (( chan > 14 )) && echo "5/6 GHz" || echo "2.4 GHz")" "${rate:-?}"
+        if [[ "$dbm" =~ ^-[0-9]+$ ]]; then
+            if (( dbm < -75 )); then
+                issues+=("very weak Wi-Fi signal ($dbm dBm)")
+            elif (( dbm < -67 )); then
+                issues+=("weak Wi-Fi signal ($dbm dBm, ideally above -67)")
+            fi
+        elif [[ "$signal" =~ ^[0-9]+$ ]] && (( signal < 50 )); then
+            issues+=("weak Wi-Fi signal ($signal%)")
+        fi
+    else
+        speed=$(cat "$sys/speed" 2>/dev/null) || speed=""
+        duplex=$(cat "$sys/duplex" 2>/dev/null) || duplex=""
+        if [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )); then
+            kind="cable"
+            header "Cable"
+            echo "Link ${speed} Mb/s · ${duplex:-?} duplex"
+            if (( speed < 1000 )); then
+                issues+=("cable link negotiated at only $speed Mb/s")
+            fi
+            if [[ "$duplex" == half ]]; then
+                issues+=("half duplex link")
+            fi
+        else
+            kind="virtual"
+            header "Link"
+            echo "Virtual or VPN interface: no physical link to check."
+        fi
+    fi
+
+    echo
+    header "Counters since boot"
+    rx=$(cat "$sys/statistics/rx_packets" 2>/dev/null) || rx=0
+    tx=$(cat "$sys/statistics/tx_packets" 2>/dev/null) || tx=0
+    errs=$(( $(cat "$sys/statistics/rx_errors" 2>/dev/null || echo 0) + $(cat "$sys/statistics/tx_errors" 2>/dev/null || echo 0) ))
+    drops=$(cat "$sys/statistics/rx_dropped" 2>/dev/null) || drops=0
+    echo "Packets rx $rx · tx $tx · errors $errs · dropped $drops"
+    # Erros acima de 0,1% dos pacotes indicam problema físico (cabo, sinal) ou de driver
+    if (( errs > 0 && errs * 1000 > rx + tx )); then
+        issues+=("transmission errors on $errs packets")
+    fi
+
+    if (( ${#issues[@]} == 0 )); then
+        ok "Link OK."
+        return
+    fi
+    local msg
+    msg=$(printf '%s; ' "${issues[@]}")
+    warn "Link problems: ${msg%; }."
+    case "$kind" in
+        wifi)
+            fix "the device is too far from the router or the channel is crowded; move closer, prefer 5 GHz, then reconnect." \
+                "nmcli -f IN-USE,SSID,SIGNAL,CHAN,RATE dev wifi list ifname $dev" \
+                "nmcli connection up \"$conn\"   # reconnect" \
+                "# Still weak? Change the router channel or add a mesh node / access point." ;;
+        cable)
+            fix "a damaged or old cable (or a 100 Mb/s router port); swap the cable for Cat5e/Cat6, then renegotiate the link." \
+                "ethtool $dev   # 'Speed' and 'Duplex' after the swap" \
+                "sudo ethtool -r $dev   # renegotiate without unplugging" ;;
+        *)
+            fix "errors on the interface usually come from the driver or the device behind it; check the kernel log." \
+                "sudo dmesg | grep -i $dev | tail -n 20" ;;
+    esac
+}
+
+# IP público (IPv4) e conectividade IPv6
+pane_ip() {
+    local trace="" ip4="" ip6="" global conn
+    if ! command -v curl >/dev/null 2>&1; then
+        fail "curl not found: install curl for this test."
+        fix "curl is not installed, so the public IP test cannot run." "$(install_hint curl)"
+        return
+    fi
+    conn=$(nm_conn)
+
+    header "Public IPv4"
+    trace=$(curl -4 -sS --max-time 6 https://1.1.1.1/cdn-cgi/trace) || trace=""
+    ip4=$(sed -n 's/^ip=//p' <<<"$trace")
+    if [[ -n "$ip4" ]]; then
+        awk -F= '{ v[$1] = $2 } END {
+                printf "IP %s · country %s · Cloudflare edge %s%s\n", v["ip"], v["loc"], v["colo"],
+                    (v["warp"] == "on" ? " · Cloudflare WARP on" : "")
+            }' <<<"$trace"
+    else
+        echo "(no response)"
+    fi
+
+    echo
+    header "IPv6"
+    # Endereço global de verdade: ignora os ULA (fc00::/7), que não saem para a internet
+    global=$(ip -6 addr show scope global 2>/dev/null |
+        awk '$1 == "inet6" && $2 !~ /^f[cd]/ { sub(/\/.*/, "", $2); print $2; exit }') || global=""
+    echo "Global address: ${global:-none}"
+    trace=$(curl -6 -sS --max-time 6 'https://[2606:4700:4700::1111]/cdn-cgi/trace' 2>/dev/null) || trace=""
+    ip6=$(sed -n 's/^ip=//p' <<<"$trace")
+    echo "Public IPv6: ${ip6:-no connectivity}"
+
+    if [[ -z "$ip4" && -z "$ip6" ]]; then
+        fail "No internet over IPv4 or IPv6 (see the Gateway and Ping panes in the first tab)."
+        fix "the connection is down; renew it, then restart the modem/router if that does not help." \
+            "nmcli device status" \
+            "nmcli connection up \"$conn\""
+    elif [[ -z "$ip4" ]]; then
+        warn "IPv6 works but IPv4 does not."
+        fix "the router or provider lost the IPv4 session (or DHCP failed); renew the connection, then restart the router." \
+            "nmcli connection up \"$conn\""
+    elif [[ -n "$global" && -z "$ip6" ]]; then
+        warn "Broken IPv6: this machine has a global IPv6 address but cannot reach the internet over it (apps may stall before falling back to IPv4)."
+        fix "the router or provider announces IPv6 but does not route it; restart the router, or disable IPv6 on this connection as a workaround." \
+            "ip -6 route show default" \
+            "nmcli connection modify \"$conn\" ipv6.method disabled && nmcli connection up \"$conn\""
+    elif [[ -n "$ip6" ]]; then
+        ok "IPv4 and IPv6 working."
+    else
+        ok "IPv4 working."
+        info "No IPv6: the provider or router does not offer it. Not a problem, though enabling it on the router helps with CGNAT."
+    fi
+}
+
+# Testa se um pacote ICMP de <tamanho> passa sem fragmentar (bit DF ligado)
+mtu_probe() {
+    LC_ALL=C ping -c2 -i 0.2 -W1 -M "do" -s "$2" "$1" >/dev/null 2>&1
+}
+
+# MTU do caminho: maior pacote que chega ao destino sem fragmentar (busca binária)
+pane_mtu() {
+    local host="$1" dev mtu lo hi mid path conn prop
+    dev=$(default_iface)
+    mtu=$(cat "/sys/class/net/$dev/mtu" 2>/dev/null) || mtu=1500
+
+    header "Path MTU to $host (interface ${dev:-?}: MTU $mtu)"
+    if ! mtu_probe "$host" 56; then
+        info "$host does not answer ping (or this ping lacks -M do): path MTU cannot be measured."
+        return
+    fi
+    # 28 = cabeçalhos IPv4 (20) + ICMP (8)
+    if mtu_probe "$host" $((mtu - 28)); then
+        echo "$mtu bytes: passes"
+        ok "Path MTU $mtu: full-size packets reach $host."
+        return
+    fi
+    echo "$mtu bytes: too big, searching..."
+    lo=56 hi=$((mtu - 28))
+    while (( hi - lo > 1 )); do
+        mid=$(( (lo + hi) / 2 ))
+        if mtu_probe "$host" "$mid"; then
+            lo=$mid; echo "$((mid + 28)) bytes: passes"
+        else
+            hi=$mid; echo "$((mid + 28)) bytes: too big"
+        fi
+    done
+    path=$((lo + 28))
+
+    if [[ -d "/sys/class/net/$dev/wireless" ]]; then prop="802-11-wireless"; else prop="802-3-ethernet"; fi
+    conn=$(nm_conn "$dev")
+    warn "Path MTU is $path bytes, below the interface MTU ($mtu): usually PPPoE (1492), a VPN or a tunnel along the way."
+    fix "normally handled automatically; only if some sites or a VPN hang while loading, lower the MTU to match." \
+        "sudo ip link set dev $dev mtu $path   # temporary, until reconnecting" \
+        "nmcli connection modify \"$conn\" $prop.mtu $path && nmcli connection up \"$conn\"   # permanent"
+}
+
+# Velocidade de resposta do DNS: servidores do sistema × DNS públicos
+pane_dnsbench() {
+    local dev s n out t sum cnt fails best="" best_ms="" sys_ms="" sys_fails=0 conn
+    local -a sys=() servers=() names=(google.com wikipedia.org github.com amazon.com cloudflare.com)
+    local -A avg=()
+
+    if ! command -v dig >/dev/null 2>&1; then
+        fail "dig not found: install it for this test."
+        fix "dig is not installed, so the DNS speed test cannot run." "$(install_hint dig)"
+        return
+    fi
+    dev=$(default_iface)
+    conn=$(nm_conn "$dev")
+
+    # Servidores reais do sistema: com systemd-resolved, o 127.0.0.53 é só um cache local
+    if command -v resolvectl >/dev/null 2>&1 && [[ -n "$dev" ]]; then
+        read -ra sys < <(resolvectl dns "$dev" 2>/dev/null | sed 's/^[^:]*: *//; s/#[^ ]*//g') || true
+    fi
+    if (( ${#sys[@]} == 0 )); then
+        read -ra sys < <(awk '/^nameserver/ { printf "%s ", $2 }' /etc/resolv.conf 2>/dev/null) || true
+    fi
+    sys=("${sys[@]:0:2}")
+    servers=("${sys[@]}")
+    for s in 1.1.1.1 8.8.8.8 9.9.9.9; do
+        [[ " ${servers[*]} " == *" $s "* ]] || servers+=("$s")
+    done
+
+    header "DNS response time (average of ${#names[@]} queries)"
+    printf '%-26s %7s %6s\n' "Resolver" "avg ms" "fails"
+    for s in "${servers[@]}"; do
+        sum=0 cnt=0 fails=0
+        for n in "${names[@]}"; do
+            out=$(dig +time=2 +tries=1 "@$s" "$n" A 2>/dev/null) || out=""
+            t=$(sed -n 's/^;; Query time: \([0-9]*\) msec.*/\1/p' <<<"$out")
+            if [[ -n "$t" && "$out" == *"status: NOERROR"* ]]; then
+                sum=$((sum + t)) cnt=$((cnt + 1))
+            else
+                fails=$((fails + 1))
+            fi
+        done
+        local label="$s"
+        [[ " ${sys[*]} " == *" $s "* ]] && label="$s (system)"
+        if (( cnt )); then
+            avg[$s]=$((sum / cnt))
+            printf '%-26s %7s %6s\n' "$label" "${avg[$s]}" "$fails"
+        else
+            printf '%-26s %7s %6s\n' "$label" "-" "$fails"
+        fi
+        if [[ " ${sys[*]} " == *" $s "* ]]; then
+            sys_fails=$((sys_fails + fails))
+            if [[ -n "${avg[$s]:-}" ]] && [[ -z "$sys_ms" ]]; then sys_ms=${avg[$s]}; fi
+        elif [[ -n "${avg[$s]:-}" ]] && (( ${avg[$s]} < ${best_ms:-999999} )); then
+            best=$s best_ms=${avg[$s]}
+        fi
+    done
+
+    if (( ${#sys[@]} == 0 )); then
+        info "No system DNS server found to compare."
+    elif [[ -z "$sys_ms" ]]; then
+        fail "The system DNS server (${sys[*]}) did not answer any query."
+        fix "the configured resolver (usually the router) is down; switch this connection to public DNS servers." \
+            "nmcli connection modify \"$conn\" ipv4.dns \"${best:-1.1.1.1} 8.8.8.8\" ipv4.ignore-auto-dns yes" \
+            "nmcli connection up \"$conn\""
+    elif [[ -n "$best_ms" ]] && (( sys_ms > 2 * best_ms && sys_ms - best_ms > 20 )); then
+        warn "System DNS answers in $sys_ms ms, while $best answers in $best_ms ms: every new site takes longer to open."
+        fix "switch this connection to the faster public DNS." \
+            "nmcli connection modify \"$conn\" ipv4.dns \"$best 8.8.8.8\" ipv4.ignore-auto-dns yes" \
+            "nmcli connection up \"$conn\""
+    elif (( sys_fails > 0 )); then
+        warn "System DNS dropped $sys_fails queries: unreliable resolver."
+        fix "the router's DNS is overloaded or flaky; restart the router or switch to public DNS." \
+            "nmcli connection modify \"$conn\" ipv4.dns \"${best:-1.1.1.1} 8.8.8.8\" ipv4.ignore-auto-dns yes" \
+            "nmcli connection up \"$conn\""
+    else
+        ok "System DNS is fast: $sys_ms ms${best:+ (fastest public: $best, $best_ms ms)}."
+    fi
+}
+
+# Portas de saída: detecta firewall filtrando serviços comuns
+pane_ports() {
+    local c name host port smtp_blocked=0 quic=""
+    local -a blocked=() checks=(
+        "DNS over TCP|1.1.1.1|53"
+        "DNS over TLS|1.1.1.1|853"
+        "HTTP|1.1.1.1|80"
+        "HTTPS|1.1.1.1|443"
+        "SSH|github.com|22"
+        "Mail submission|smtp.gmail.com|587"
+        "IMAPS|imap.gmail.com|993"
+        "SMTP|smtp.gmail.com|25"
+    )
+    if ! command -v timeout >/dev/null 2>&1; then
+        info "timeout (coreutils) not found: port test skipped."
+        return
+    fi
+
+    header "Outbound TCP ports"
+    for c in "${checks[@]}"; do
+        IFS='|' read -r name host port <<<"$c"
+        # shellcheck disable=SC2016 # $1 e $2 são expandidos pelo bash interno
+        if timeout 4 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null; then
+            printf '✅ %-5s %-16s %s\n' "$port" "$name" "$host"
+        else
+            printf '❌ %-5s %-16s %s\n' "$port" "$name" "$host"
+            if [[ "$port" == 25 ]]; then smtp_blocked=1; else blocked+=("$port ($name)"); fi
+        fi
+    done
+    # QUIC/HTTP3 (UDP 443), se o curl tiver suporte
+    if command -v curl >/dev/null 2>&1 && curl --version | grep -q HTTP3; then
+        if curl --http3-only -s -o /dev/null --max-time 5 https://cloudflare.com; then
+            quic="ok"; printf '✅ %-5s %-16s %s\n' "443u" "QUIC (HTTP/3)" "cloudflare.com"
+        else
+            quic="blocked"; printf '❌ %-5s %-16s %s\n' "443u" "QUIC (HTTP/3)" "cloudflare.com"
+        fi
+    fi
+
+    if (( ${#blocked[@]} == 0 )); then
+        ok "All essential ports are open."
+    elif (( ${#blocked[@]} >= 7 )); then
+        fail "No outbound TCP connection works: no internet, or a firewall blocks everything."
+        fix "check this machine's firewall first; if it is clean, the network itself is filtering." \
+            "sudo ufw status verbose" \
+            "sudo nft list ruleset | grep -iE 'drop|reject'"
+    else
+        local msg
+        msg=$(printf '%s, ' "${blocked[@]}")
+        warn "Blocked outbound ports: ${msg%, }."
+        fix "a firewall on this machine or on the network (corporate, school or public Wi-Fi) filters them." \
+            "sudo ufw status verbose" \
+            "sudo nft list ruleset | grep -iE 'drop|reject'" \
+            "# On a network you don't control, a VPN over port 443 usually gets through."
+    fi
+    if (( smtp_blocked )); then
+        info "Port 25 (SMTP) is blocked: normal on home connections, ISPs block it against spam. Use 587 to send mail."
+    fi
+    if [[ "$quic" == blocked ]]; then
+        info "QUIC (UDP 443) is blocked: browsers fall back to TCP, slightly slower. Nothing to fix."
+    fi
+}
+
+# MTR: perda de pacotes em cada salto da rota, CGNAT e NAT duplo
+pane_mtr() {
+    local host="$1" out h a l n i start final_ip final_loss cgnat="" dnat="" mid_loss=0
+    local -a hop=() ip=() loss=()
+
+    if ! command -v mtr >/dev/null 2>&1; then
+        info "mtr is not installed: it measures packet loss on every hop of the route."
+        fix "install mtr to enable this test." "$(install_hint mtr)"
+        return
+    fi
+    header "MTR: $host (10 cycles, ~10 s)"
+    if ! out=$(LC_ALL=C mtr -rwnc 10 "$host" 2>&1); then
+        echo "$out"
+        fail "mtr could not run."
+        fix "mtr needs permission to send raw packets; run it with sudo or grant the capability once." \
+            "sudo mtr -rwnc 10 $host" \
+            "sudo setcap cap_net_raw+ep \"\$(command -v mtr-packet)\""
+        return
+    fi
+    echo "$out"
+
+    # Linhas de salto: "  3.|-- 201.1.225.20   0.0%   10  ..." ("???" = salto que não responde)
+    while read -r h a l; do
+        hop+=("$h") ip+=("$a") loss+=("$l")
+    done < <(awk '$1 ~ /^[0-9]+\.\|--$/ { h = $1; sub(/\..*/, "", h); l = $3; sub(/%$/, "", l); print h, $2, l }' <<<"$out")
+    n=${#hop[@]}
+    if (( n == 0 )); then
+        fail "mtr returned no hops."
+        return
+    fi
+    final_ip=${ip[n-1]} final_loss=${loss[n-1]}
+
+    # CGNAT: salto em 100.64.0.0/10; NAT duplo: segundo salto com endereço privado
+    for ((i = 1; i < n; i++)); do
+        if [[ -z "$cgnat" && "${ip[i]}" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
+            cgnat="hop ${hop[i]} (${ip[i]})"
+        fi
+    done
+    if (( n > 2 )) && [[ "${ip[1]}" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
+        dnat="${ip[1]}"
+    fi
+
+    if [[ "$final_ip" == "???" ]]; then
+        info "$host does not answer mtr probes; the route above is still valid."
+    elif gt "$final_loss" 0; then
+        # Início da perda contínua até o destino (saltos que não respondem são ignorados)
+        start=$((n - 1))
+        for ((i = n - 2; i >= 0; i--)); do
+            [[ "${ip[i]}" == "???" ]] && continue
+            gt "${loss[i]}" 0 || break
+            start=$i
+        done
+        if (( start == n - 1 )); then
+            warn "Loss only at the destination ($final_loss%): possibly $host rate-limiting replies; confirm with the Ping panes in the first tab."
+        elif (( start == 0 )); then
+            warn "Packet loss ($final_loss%) starts at hop 1 (${ip[0]}, your router): local problem."
+            fix "weak Wi-Fi, a bad cable or an overloaded router; check the link and restart the router." \
+                "nmcli -f IN-USE,SSID,SIGNAL,CHAN dev wifi list" \
+                "# See the Interface pane for signal and cable details."
+        elif (( start <= 3 )); then
+            warn "Packet loss ($final_loss%) starts at hop ${hop[start]} (${ip[start]}), inside your provider's network."
+            fix "restart the modem/router; if loss persists, send a longer report to your ISP." \
+                "mtr -rwnc 100 $host > mtr-report.txt"
+        else
+            warn "Packet loss ($final_loss%) starts at hop ${hop[start]} (${ip[start]}), beyond your provider."
+            fix "a distant network is congested; nothing to fix locally, it is usually temporary. Re-test later." \
+                "mtr -rwnc 100 $host"
+        fi
+    else
+        for ((i = 0; i < n - 1; i++)); do
+            if [[ "${ip[i]}" != "???" ]] && gt "${loss[i]}" 0; then mid_loss=1; fi
+        done
+        ok "No packet loss to $host."
+        if (( mid_loss )); then
+            info "Loss shown only at intermediate hops is those routers rate-limiting replies, not real loss."
+        fi
+    fi
+
+    if [[ -n "$cgnat" ]]; then
+        info "CGNAT detected at $cgnat: your router has no public IPv4, so port forwarding and hosting from home will not work."
+        fix "ask the ISP for a public IPv4, or reach your network another way." \
+            "# Ask the ISP for a public (or fixed) IPv4, or use IPv6, Tailscale or Cloudflare Tunnel."
+    fi
+    if [[ -n "$dnat" ]]; then
+        info "Double NAT likely: hop 2 ($dnat) is a private address, so your router sits behind another router (usually the ISP modem)."
+        fix "only matters for port forwarding, gaming NAT type or VPN servers: put the ISP modem in bridge mode." \
+            "# Done in the modem's admin page; the ISP can also switch it remotely."
+    fi
+}
+
+# Média das latências (campos time=) de uma saída de ping
+rtt_avg() {
+    awk -F'time=' 'NF > 1 { split($2, a, " "); s += a[1]; n++ } END { if (n) printf "%.1f", s / n }' "$@"
+}
+
+# Velocidade (Cloudflare) com bufferbloat: latência ociosa × latência durante download e upload
+pane_speed() {
+    local secs="$1" delay="$2" host="$3" gw="$4" tmp idle dir i p pinger mbps lat inc max_inc=0 grade bytes total=0
+    local -A rate=()
+    local -a pids=()
+
+    if ! command -v curl >/dev/null 2>&1; then
+        fail "curl not found: install curl for this test."
+        fix "curl is not installed, so the speed test cannot run." "$(install_hint curl)"
+        return
+    fi
+    header "Speed test: speed.cloudflare.com, ${secs}s each way"
+    if (( delay > 0 )); then
+        echo "Starts in ${delay}s so it does not skew the other panes (Enter = start now)."
+        read -r -t "$delay" _ || true
+    fi
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2064 # o caminho é fixado agora, de propósito
+    trap "rm -rf '$tmp'" EXIT
+
+    echo
+    LC_ALL=C ping -c10 -i 0.2 -W1 "$host" >"$tmp/idle" 2>/dev/null || true
+    idle=$(rtt_avg "$tmp/idle")
+    echo "Idle latency to $host: ${idle:-n/a} ms"
+
+    for dir in down up; do
+        pids=()
+        # Ping em paralelo mede a latência com o link carregado
+        LC_ALL=C ping -i 0.2 -W1 -w "$((secs + 1))" "$host" >"$tmp/ping-$dir" 2>/dev/null &
+        pinger=$!
+        # 4 conexões simultâneas para aproveitar links rápidos
+        for i in 1 2 3 4; do
+            if [[ "$dir" == down ]]; then
+                curl -s -o /dev/null --max-time "$secs" -w '%{size_download} %{time_total}\n' \
+                    'https://speed.cloudflare.com/__down?bytes=99000000' >"$tmp/$dir-$i" 2>/dev/null &
+            else
+                head -c 99000000 /dev/zero | curl -s -o /dev/null --max-time "$secs" -X POST -T - \
+                    -w '%{size_upload} %{time_total}\n' 'https://speed.cloudflare.com/__up' >"$tmp/$dir-$i" 2>/dev/null &
+            fi
+            pids+=($!)
+        done
+        for p in "${pids[@]}"; do wait "$p" || true; done
+        kill "$pinger" 2>/dev/null || true
+        wait "$pinger" 2>/dev/null || true
+
+        bytes=$(awk '{ b += $1 } END { printf "%d", b }' "$tmp/$dir"-*)
+        total=$((total + bytes))
+        mbps=$(awk '{ b += $1; if ($2 > t) t = $2 } END { if (t > 0 && b > 100000) printf "%.1f", b * 8 / t / 1e6 }' "$tmp/$dir"-*)
+        lat=$(rtt_avg "$tmp/ping-$dir")
+        rate[$dir]="$mbps"
+        inc=""
+        if [[ -n "$idle" && -n "$lat" ]]; then
+            inc=$(awk -v a="$lat" -v b="$idle" 'BEGIN { d = a - b; printf "%.1f", (d > 0 ? d : 0) }')
+            if gt "$inc" "$max_inc"; then max_inc=$inc; fi
+        fi
+        printf '%-8s %s Mb/s · latency under load %s ms%s\n' \
+            "$( [[ "$dir" == down ]] && echo Download || echo Upload)" "${mbps:-n/a}" "${lat:-n/a}" "${inc:+ (+$inc)}"
+    done
+    echo "Data used: ~$((total / 1000000)) MB"
+
+    if [[ -z "${rate[down]}" ]]; then
+        fail "Could not reach the speed test server."
+        fix "speed.cloudflare.com may be blocked on this network or temporarily down." \
+            "curl -I https://speed.cloudflare.com" \
+            "# Or test in the browser: https://speed.cloudflare.com"
+        return
+    fi
+    if [[ -z "$idle" ]]; then
+        ok "Download ${rate[down]} Mb/s · Upload ${rate[up]:-n/a} Mb/s."
+        info "$host does not answer ping: bufferbloat not measured."
+        return
+    fi
+    # Escala de bufferbloat (aumento de latência sob carga), a mesma usada pelos testes do Waveform
+    grade=$(awk -v d="$max_inc" 'BEGIN {
+            if (d < 5) g = "A+"; else if (d < 30) g = "A"; else if (d < 60) g = "B"
+            else if (d < 200) g = "C"; else if (d < 400) g = "D"; else g = "F"; print g }')
+    if [[ "$grade" == A* || "$grade" == B ]]; then
+        ok "Download ${rate[down]} Mb/s · Upload ${rate[up]:-n/a} Mb/s · bufferbloat $grade (+$max_inc ms under load)."
+    else
+        warn "Bufferbloat $grade: latency rises by $max_inc ms under load, so calls and games lag while something downloads or uploads."
+        local -a cmds=("# In the router: enable SQM / Smart Queue / QoS (fq_codel or CAKE),"
+                       "# limited to ~90% of the measured speeds (${rate[down]} down, ${rate[up]:-?} up Mb/s).")
+        if [[ "$gw" =~ ^[0-9.]+$ ]]; then cmds+=("xdg-open http://$gw   # router admin page"); fi
+        fix "the router buffers too much traffic; turning on smart queue management fixes it." "${cmds[@]}"
+    fi
+}
+
 if [[ "${1:-}" == "--pane" ]]; then
     kind="${2:-}"
     shift 2 || true
@@ -293,6 +838,13 @@ if [[ "${1:-}" == "--pane" ]]; then
         dns)     pane_dns "$@" ;;
         http)    pane_http "$@" ;;
         route)   pane_route "$@" ;;
+        iface)   pane_iface "$@" ;;
+        ip)      pane_ip "$@" ;;
+        mtu)     pane_mtu "$@" ;;
+        dnsbench) pane_dnsbench "$@" ;;
+        ports)   pane_ports "$@" ;;
+        mtr)     pane_mtr "$@" ;;
+        speed)   pane_speed "$@" ;;
         *)       echo "Unknown pane: $kind" >&2; exit 1 ;;
     esac
     exit 0
@@ -301,6 +853,21 @@ fi
 # ---------------------------------------------------------------------------
 # Configuração e criação da sessão
 # ---------------------------------------------------------------------------
+
+ADVANCED=0
+SHOW_HELP=0
+for arg in "$@"; do
+    case "$arg" in
+        -a|--advanced) ADVANCED=1 ;;
+        -h|--help)     SHOW_HELP=1 ;;
+        *)
+            echo "Error: unknown option: $arg" >&2
+            echo "" >&2
+            echo "💡 Most likely fix: use one of the supported options." >&2
+            echo "     \$ $(basename "$0") --help" >&2
+            exit 1 ;;
+    esac
+done
 
 # Gateway da rota padrão (IPv4, senão IPv6). Imprime o IP, "no-via" se a rota não
 # tiver gateway (VPN), "no-route" se não houver rota padrão, ou nada se não der para saber
@@ -359,6 +926,10 @@ LAT_SLOW=$(int_or "${PT_LAT_SLOW:-}" 60)
 LAT_VERY_SLOW=$(int_or "${PT_LAT_VERY_SLOW:-}" 150)
 JITTER_MAX=$(int_or "${PT_JITTER:-}" 30)
 
+# Teste de velocidade do modo avançado: segundos por sentido (0 desativa) e espera inicial
+SPEED_SECONDS=$(int_or "${PT_SPEED_SECONDS:-}" 8)
+SPEED_DELAY=$(int_or "${PT_SPEED_DELAY:-}" 30)
+
 case "$GATEWAY" in
     "")       GATEWAY_LABEL="(not detected)" ;;
     no-route) GATEWAY_LABEL="(no default route)" ;;
@@ -368,9 +939,9 @@ esac
 
 if command -v traceroute >/dev/null 2>&1; then ROUTE_TOOL="traceroute"; else ROUTE_TOOL="tracepath"; fi
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if (( SHOW_HELP )); then
     cat <<EOF
-Usage: $(basename "$0")
+Usage: $(basename "$0") [-a | --advanced] [-h | --help]
 
 Opens the tmux session '$SESSION' with six diagnostic panes:
   Gateway   ping -c5 $GATEWAY_LABEL
@@ -383,9 +954,19 @@ Opens the tmux session '$SESSION' with six diagnostic panes:
 Ping latency: OK up to ${LAT_SLOW} ms, very slow above ${LAT_VERY_SLOW} ms,
 unstable with jitter above ${JITTER_MAX} ms.
 
+-a, --advanced adds two tabs (switch with Ctrl+b n / Ctrl+b p):
+  advanced  Interface   Wi-Fi signal or cable speed, interface errors
+            Public IP   public IPv4 and IPv6 connectivity
+            MTU         path MTU to $PING_1
+            DNS speed   system resolver vs 1.1.1.1, 8.8.8.8 and 9.9.9.9
+            Ports       outbound TCP ports (53, 80, 443, 22, 587, ...) and QUIC
+            MTR         per-hop packet loss to $TRACE, CGNAT and double NAT
+  speed     download/upload and bufferbloat, ${SPEED_SECONDS}s each way after ${SPEED_DELAY}s
+            (uses data: up to a few hundred MB on fast links; PT_SPEED_SECONDS=0 skips it)
+
 Environment variables: PT_GATEWAY, PT_PING_1, PT_PING_2, PT_PING_DNS,
 PT_DNS_SERVER, PT_HTTP_URL, PT_PORTAL_URL, PT_TRACE,
-PT_LAT_SLOW, PT_LAT_VERY_SLOW, PT_JITTER
+PT_LAT_SLOW, PT_LAT_VERY_SLOW, PT_JITTER, PT_SPEED_SECONDS, PT_SPEED_DELAY
 EOF
     exit 0
 fi
@@ -441,6 +1022,8 @@ if ! LAST=$(tmux new-session -d -s "$SESSION" -P -F '#{pane_id}' \
     exit 1
 fi
 FIRST="$LAST"
+# Opções de sessão usam o ID ($N): o tmux 3.4 não aceita "=nome" no set-option
+SESSION_ID=$(tmux display-message -p -t "$FIRST" '#{session_id}')
 tmux set-option -p -t "$LAST" @pt_title "Gateway $GATEWAY_LABEL" 2>/dev/null || true
 
 # Adiciona um painel após o último e reorganiza em grade a cada passo,
@@ -459,12 +1042,43 @@ add_pane "DNS $PING_DNS"    "$SELF" --pane dns "$PING_DNS" "$DNS_SERVER"
 add_pane "HTTP"             "$SELF" --pane http "$HTTP_URL" "$PORTAL_URL"
 add_pane "Route $TRACE ($ROUTE_TOOL)" "$SELF" --pane route "$TRACE"
 
+# Identifica cada painel da janela na borda superior
+label_panes() {
+    tmux set-option -w -t "$1" pane-border-status top >/dev/null 2>&1 || true
+    tmux set-option -w -t "$1" pane-border-format ' #{@pt_title} ' >/dev/null 2>&1 || true
+}
+
+# Abre uma nova aba (janela tmux) em segundo plano com um primeiro painel
+add_window() {
+    local name="$1" title="$2"
+    shift 2
+    LAST=$(tmux new-window -d -t "$TARGET:" -n "$name" -P -F '#{pane_id}' "$(pane_cmd "$@")")
+    tmux set-option -p -t "$LAST" @pt_title "$title" 2>/dev/null || true
+    label_panes "$LAST"
+}
+
+label_panes "$FIRST"
 tmux select-pane -t "$FIRST"
 
-# Desativa a barra de status e identifica cada painel na borda superior
-tmux set-option -t "$TARGET" status off >/dev/null 2>&1 || true
-tmux set-option -w -t "$TARGET:" pane-border-status top >/dev/null 2>&1 || true
-tmux set-option -w -t "$TARGET:" pane-border-format ' #{@pt_title} ' >/dev/null 2>&1 || true
+if (( ADVANCED )); then
+    tmux rename-window -t "$FIRST" basic
+    add_window advanced "Interface"  "$SELF" --pane iface
+    add_pane "Public IP / IPv6"      "$SELF" --pane ip
+    add_pane "MTU $PING_1"           "$SELF" --pane mtu "$PING_1"
+    add_pane "DNS speed"             "$SELF" --pane dnsbench
+    add_pane "Ports"                 "$SELF" --pane ports
+    add_pane "MTR $TRACE"            "$SELF" --pane mtr "$TRACE"
+    if (( SPEED_SECONDS > 0 )); then
+        add_window speed "Speed and bufferbloat" \
+            "$SELF" --pane speed "$SPEED_SECONDS" "$SPEED_DELAY" "$PING_1" "$GATEWAY"
+    fi
+    # Barra de status com as abas e o atalho para alternar entre elas
+    tmux set-option -t "$SESSION_ID" status on >/dev/null 2>&1 || true
+    tmux set-option -t "$SESSION_ID" status-right ' Ctrl+b n/p: next/previous tab ' >/dev/null 2>&1 || true
+    tmux set-option -t "$SESSION_ID" status-right-length 40 >/dev/null 2>&1 || true
+else
+    tmux set-option -t "$SESSION_ID" status off >/dev/null 2>&1 || true
+fi
 
 # Conecta à sessão e só então descarta a anterior
 if [[ -n "${TMUX:-}" ]]; then
