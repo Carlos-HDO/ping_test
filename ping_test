@@ -1025,6 +1025,8 @@ FIRST="$LAST"
 # Opções de sessão usam o ID ($N): o tmux 3.4 não aceita "=nome" no set-option
 SESSION_ID=$(tmux display-message -p -t "$FIRST" '#{session_id}')
 tmux set-option -p -t "$LAST" @pt_title "Gateway $GATEWAY_LABEL" 2>/dev/null || true
+# Roda do mouse rola o histórico do painel e o clique seleciona o painel
+tmux set-option -t "$SESSION_ID" mouse on >/dev/null 2>&1 || true
 
 # Adiciona um painel após o último e reorganiza em grade a cada passo,
 # para que a sessão (criada com tamanho padrão) sempre tenha espaço
@@ -1046,6 +1048,8 @@ add_pane "Route $TRACE ($ROUTE_TOOL)" "$SELF" --pane route "$TRACE"
 label_panes() {
     tmux set-option -w -t "$1" pane-border-status top >/dev/null 2>&1 || true
     tmux set-option -w -t "$1" pane-border-format ' #{@pt_title} ' >/dev/null 2>&1 || true
+    # Barra de rolagem lateral em cada painel (só existe no tmux 3.6+; antes falha sem aviso)
+    tmux set-option -w -t "$1" pane-scrollbars on >/dev/null 2>&1 || true
 }
 
 # Abre uma nova aba (janela tmux) em segundo plano com um primeiro painel

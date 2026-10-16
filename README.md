@@ -109,6 +109,12 @@ PT_PING_1=192.168.0.1 PT_TRACE=example.com pt
 | `PT_SPEED_SECONDS` | `8` | Duração (s) de cada sentido do teste de velocidade no modo `-a`; `0` desativa a aba |
 | `PT_SPEED_DELAY` | `30` | Espera (s) antes do teste de velocidade, para não distorcer os outros painéis (Enter inicia na hora) |
 
+### Rolar o histórico de um painel
+
+A sessão `pt` liga o mouse do `tmux`: a roda rola o histórico do painel sob o cursor, e o clique seleciona o painel. Para selecionar texto com o mouse, segure **Shift**. Sem mouse, use `Ctrl+b [`, role com as setas ou PgUp/PgDn e saia com `q`.
+
+No `tmux` 3.6 ou mais novo, cada painel também ganha uma barra de rolagem lateral. Nas versões anteriores ela não existe, e o resto funciona igual.
+
 ### Encerrar ou desconectar da sessão
 
 ```bash
